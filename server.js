@@ -319,26 +319,19 @@ async function scrapeEpisode(epSlug) {
     }
   }
 
-  doc.querySelectorAll('.mirrorstream > ul').forEach(ul => {
-    const prevEl = ul.previousElementSibling;
-    const qualityRaw = txt(prevEl) || '';
-    const qualityMatch = qualityRaw.match(/(\d{3,4}p)/i);
-    const quality = qualityMatch ? qualityMatch[1] : (qualityRaw || 'HD');
-
-    ul.querySelectorAll('li a[data-content]').forEach(link => {
-      const serverId = attr(link, 'data-content');
-      const serverName = txt(link);
-      if (!serverId) return;
-      try {
-        const raw = JSON.parse(Buffer.from(serverId, 'base64').toString('utf-8'));
-        const enriched = { ...raw, nonce, referer: url };
-        if (mainAction && !enriched.action) enriched.action = mainAction;
-        const encodedId = Buffer.from(JSON.stringify(enriched)).toString('base64');
-        servers.push({ name: `${quality} - ${serverName}`, quality, serverName, serverId: encodedId, needsPost: true });
-      } catch(e) {
-        servers.push({ name: `${quality} - ${serverName}`, quality, serverName, serverId, needsPost: true });
-      }
-    });
+  doc.querySelectorAll('.mirrorstream li a[data-content]').forEach((link, i) => {
+    const serverId = attr(link, 'data-content');
+    const serverName = txt(link) || ('Server ' + (i + 1));
+    if (!serverId) return;
+    try {
+      const raw = JSON.parse(Buffer.from(serverId, 'base64').toString('utf-8'));
+      const enriched = { ...raw, nonce, referer: url };
+      if (mainAction && !enriched.action) enriched.action = mainAction;
+      const encodedId = Buffer.from(JSON.stringify(enriched)).toString('base64');
+      servers.push({ name: serverName, serverId: encodedId, needsPost: true });
+    } catch(e) {
+      servers.push({ name: serverName, serverId, needsPost: true });
+    }
   });
 
   let prevEp = null, nextEp = null;
