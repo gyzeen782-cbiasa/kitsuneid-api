@@ -1,4 +1,4 @@
-// ===== server.js — KitsuneID API (Railway) v2 =====
+// ===== server.js — KitsuneID API (Railway) v3 =====
 const express = require('express');
 const cors = require('cors');
 const https = require('https');
@@ -12,9 +12,38 @@ const SCRAPER_KEY = '2ae12f2df6c0a613015482e8131a38ab';
 app.use(cors());
 app.use(express.json());
 
-// ── HTTP helpers ─────────────────────────────
+// ── CACHE (in-memory) ────────────────────────
+// Menyimpan hasil scrape agar request berikutnya langsung balik tanpa tunggu
+const cache = new Map();
+const CACHE_TTL = {
+  ongoing:  5 * 60 * 1000,  // 5 menit
+  complete: 10 * 60 * 1000, // 10 menit
+  schedule: 30 * 60 * 1000, // 30 menit
+  search:   5 * 60 * 1000,  // 5 menit
+  anime:    15 * 60 * 1000, // 15 menit
+  episode:  10 * 60 * 1000, // 10 menit
+};
 
-// render=false → cepat, untuk listing/detail
+function getCache(key) {
+  const item = cache.get(key);
+  if (!item) return null;
+  if (Date.now() > item.expires) { cache.delete(key); return null; }
+  return item.data;
+}
+
+function setCache(key, data, ttl) {
+  cache.set(key, { data, expires: Date.now() + ttl });
+}
+
+// Bersihkan cache yang expired setiap 5 menit
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, item] of cache.entries()) {
+    if (now > item.expires) cache.delete(key);
+  }
+}, 5 * 60 * 1000);
+
+// ── HTTP helpers ─────────────────────────────
 function fetchHTML(url) {
   return new Promise((resolve, reject) => {
     const proxyUrl = `http://api.scraperapi.com?api_key=${SCRAPER_KEY}&url=${encodeURIComponent(url)}&render=false`;
@@ -30,7 +59,6 @@ function fetchHTML(url) {
   });
 }
 
-// render=true → untuk episode agar JS dieksekusi, player muncul
 function fetchHTMLRendered(url) {
   return new Promise((resolve, reject) => {
     const proxyUrl = `http://api.scraperapi.com?api_key=${SCRAPER_KEY}&url=${encodeURIComponent(url)}&render=true`;
@@ -86,8 +114,6 @@ const toSlug = url => url
   .replace(/^\/(anime|episode)\//, '')
   .replace(/\/$/, '');
 
-// FIX #1 — Parse nomor episode yang benar
-// Cari "Episode X" dulu, fallback ke angka terakhir di judul
 function parseEpNum(title, fallback) {
   if (!title) return fallback;
   const epMatch = title.match(/episode\s+(\d+)/i) || title.match(/\bep\.?\s*(\d+)/i);
@@ -99,9 +125,11 @@ function parseEpNum(title, fallback) {
 // ── SCRAPERS ─────────────────────────────────
 
 async function scrapeOngoing(page = 1) {
-  const url = page > 1
-    ? `${BASE}/ongoing-anime/page/${page}/`
-    : `${BASE}/ongoing-anime/`;
+  const cacheKey = `ongoing_${page}`;
+  const cached = getCache(cacheKey);
+  if (cached) { console.log('Cache hit:', cacheKey); return cached; }
+
+  const url = page > 1 ? `${BASE}/ongoing-anime/page/${page}/` : `${BASE}/ongoing-anime/`;
   const doc = parse(await fetchHTML(url));
   const animes = [];
   doc.querySelectorAll('.venz ul li').forEach(li => {
@@ -117,13 +145,17 @@ async function scrapeOngoing(page = 1) {
     if (!slug || animes.find(x => x.slug === slug)) return;
     animes.push({ title, slug, url: animeUrl, thumb: getSrc(img), episode: ep || null, rating: rating || null, day: day || null, status: 'Ongoing', type: 'TV' });
   });
+
+  setCache(cacheKey, animes, CACHE_TTL.ongoing);
   return animes;
 }
 
 async function scrapeComplete(page = 1) {
-  const url = page > 1
-    ? `${BASE}/complete-anime/page/${page}/`
-    : `${BASE}/complete-anime/`;
+  const cacheKey = `complete_${page}`;
+  const cached = getCache(cacheKey);
+  if (cached) { console.log('Cache hit:', cacheKey); return cached; }
+
+  const url = page > 1 ? `${BASE}/complete-anime/page/${page}/` : `${BASE}/complete-anime/`;
   const doc = parse(await fetchHTML(url));
   const animes = [];
   doc.querySelectorAll('.venz ul li').forEach(li => {
@@ -138,10 +170,15 @@ async function scrapeComplete(page = 1) {
     if (!slug || animes.find(x => x.slug === slug)) return;
     animes.push({ title, slug, url: animeUrl, thumb: getSrc(img), episode: ep || null, rating: rating || null, status: 'Complete', type: 'TV' });
   });
+
+  setCache(cacheKey, animes, CACHE_TTL.complete);
   return animes;
 }
 
 async function scrapeSchedule() {
+  const cached = getCache('schedule');
+  if (cached) { console.log('Cache hit: schedule'); return cached; }
+
   const doc = parse(await fetchHTML(`${BASE}/jadwal-rilis/`));
   const schedules = [];
   doc.querySelectorAll('.kglist321').forEach(block => {
@@ -151,10 +188,16 @@ async function scrapeSchedule() {
     }));
     if (day) schedules.push({ day, animeList });
   });
+
+  setCache('schedule', schedules, CACHE_TTL.schedule);
   return schedules;
 }
 
 async function scrapeSearch(query) {
+  const cacheKey = `search_${query.toLowerCase().trim()}`;
+  const cached = getCache(cacheKey);
+  if (cached) { console.log('Cache hit:', cacheKey); return cached; }
+
   const doc = parse(await fetchHTML(`${BASE}/?s=${encodeURIComponent(query)}`));
   const results = [];
   doc.querySelectorAll('ul.chivsrc li').forEach(li => {
@@ -165,10 +208,16 @@ async function scrapeSearch(query) {
     if (!animeUrl) return;
     results.push({ title, slug: toSlug(animeUrl), url: animeUrl, thumb: getSrc(img), status: '' });
   });
+
+  setCache(cacheKey, results, CACHE_TTL.search);
   return results;
 }
 
 async function scrapeAnimeDetail(slug) {
+  const cacheKey = `anime_${slug}`;
+  const cached = getCache(cacheKey);
+  if (cached) { console.log('Cache hit:', cacheKey); return cached; }
+
   const html = await fetchHTML(`${BASE}/anime/${slug}/`);
   const doc = parse(html);
 
@@ -176,7 +225,6 @@ async function scrapeAnimeDetail(slug) {
   const thumb = getSrc(doc.querySelector('.fotoanime img'))
     || attr(doc.querySelector('meta[property="og:image"]'), 'content');
 
-  // FIX #3 — Synopsis: coba lebih banyak selector
   let synopsis = '';
   const synSelectors = ['.sinopc p', '.sinopc', '.sinom p', '.sinom', '.entry-content p', '[itemprop="description"]'];
   for (const sel of synSelectors) {
@@ -197,7 +245,6 @@ async function scrapeAnimeDetail(slug) {
   const genreEls = doc.querySelector('.infozingle')?.lastElementChild?.querySelectorAll('a') || [];
   const genres = genreEls.map(x => txt(x)).filter(Boolean);
 
-  // FIX #1 — Nomor episode yang benar
   const episodes = [];
   for (const block of doc.querySelectorAll('.smokelister')) {
     const bt = block.text.toLowerCase();
@@ -209,9 +256,7 @@ async function scrapeAnimeDetail(slug) {
         const epSlug = toSlug(epUrl);
         if (epSlug) {
           episodes.push({
-            title: epTitle,
-            slug: epSlug,
-            url: epUrl,
+            title: epTitle, slug: epSlug, url: epUrl,
             episode: parseEpNum(epTitle, String(i + 1))
           });
         }
@@ -221,19 +266,24 @@ async function scrapeAnimeDetail(slug) {
   }
   episodes.reverse();
 
-  return {
+  const result = {
     title, thumb, synopsis,
     rating: getInfo(2), status: getInfo(5), type: getInfo(4),
     episode: getInfo(6) || String(episodes.length) || '?',
     duration: getInfo(7), aired: getInfo(8), studio: getInfo(9),
     genres, episodes, slug,
   };
+
+  setCache(cacheKey, result, CACHE_TTL.anime);
+  return result;
 }
 
 async function scrapeEpisode(epSlug) {
-  const url = `${BASE}/episode/${epSlug}/`;
+  const cacheKey = `episode_${epSlug}`;
+  const cached = getCache(cacheKey);
+  if (cached) { console.log('Cache hit:', cacheKey); return cached; }
 
-  // FIX #2 — render=true agar JS dieksekusi dan player muncul
+  const url = `${BASE}/episode/${epSlug}/`;
   console.log('Fetching episode with render=true:', epSlug);
   const html = await fetchHTMLRendered(url);
   const doc = parse(html);
@@ -253,14 +303,11 @@ async function scrapeEpisode(epSlug) {
       const nonceJson = JSON.parse(nonceRes);
       nonce = nonceJson.data || '';
       console.log('Nonce:', nonce ? '✓' : '✗');
-    } catch(e) {
-      console.error('Nonce error:', e.message);
-    }
+    } catch(e) { console.error('Nonce error:', e.message); }
   }
 
   const servers = [];
 
-  // Cek direct iframe dulu
   const defaultIframe = doc.querySelector('.player-embed iframe')
     || doc.querySelector('#pembed iframe')
     || doc.querySelector('iframe[src*="embed"]')
@@ -272,35 +319,24 @@ async function scrapeEpisode(epSlug) {
     }
   }
 
-  // FIX #4 — Parse kualitas resolusi dengan benar (720p, 480p, dll)
   doc.querySelectorAll('.mirrorstream > ul').forEach(ul => {
     const prevEl = ul.previousElementSibling;
     const qualityRaw = txt(prevEl) || '';
-    // Ekstrak pola resolusi: 1080p, 720p, 480p, 360p
     const qualityMatch = qualityRaw.match(/(\d{3,4}p)/i);
     const quality = qualityMatch ? qualityMatch[1] : (qualityRaw || 'HD');
 
     ul.querySelectorAll('li a[data-content]').forEach(link => {
       const serverId = attr(link, 'data-content');
-      const serverName = txt(link); // GDrive, Zippyshare, dll
+      const serverName = txt(link);
       if (!serverId) return;
       try {
         const raw = JSON.parse(Buffer.from(serverId, 'base64').toString('utf-8'));
         const enriched = { ...raw, nonce, referer: url };
         if (mainAction && !enriched.action) enriched.action = mainAction;
         const encodedId = Buffer.from(JSON.stringify(enriched)).toString('base64');
-        servers.push({
-          name: `${quality} - ${serverName}`,
-          quality,       // "720p"
-          serverName,    // "GDrive"
-          serverId: encodedId,
-          needsPost: true,
-        });
+        servers.push({ name: `${quality} - ${serverName}`, quality, serverName, serverId: encodedId, needsPost: true });
       } catch(e) {
-        servers.push({
-          name: `${quality} - ${serverName}`,
-          quality, serverName, serverId, needsPost: true
-        });
+        servers.push({ name: `${quality} - ${serverName}`, quality, serverName, serverId, needsPost: true });
       }
     });
   });
@@ -308,15 +344,15 @@ async function scrapeEpisode(epSlug) {
   let prevEp = null, nextEp = null;
   doc.querySelectorAll('.flir a').forEach(link => {
     const t = txt(link).toLowerCase();
-    if (t.includes('prev') || t.includes('sebelum')) {
-      prevEp = { slug: toSlug(getHref(link)), url: getHref(link) };
-    } else if (t.includes('next') || t.includes('selanjut')) {
-      nextEp = { slug: toSlug(getHref(link)), url: getHref(link) };
-    }
+    if (t.includes('prev') || t.includes('sebelum')) prevEp = { slug: toSlug(getHref(link)), url: getHref(link) };
+    else if (t.includes('next') || t.includes('selanjut')) nextEp = { slug: toSlug(getHref(link)), url: getHref(link) };
   });
 
+  const result = { servers, prevEp, nextEp };
+  // Cache episode lebih pendek karena nonce bisa expired
+  setCache(cacheKey, result, CACHE_TTL.episode);
   console.log(`Episode ${epSlug}: ${servers.length} servers found`);
-  return { servers, prevEp, nextEp };
+  return result;
 }
 
 async function fetchServerUrl(encodedId) {
@@ -326,15 +362,11 @@ async function fetchServerUrl(encodedId) {
     const referer = params.referer || BASE;
     const { referer: _, ...postParams } = params;
     const body = new URLSearchParams(postParams).toString();
-
     console.log('Fetching server, action:', postParams.action);
-
     const res = await fetchPost(`${BASE}/wp-admin/admin-ajax.php`, body, referer);
     console.log('Server response:', res.slice(0, 100));
-
     const data = JSON.parse(res);
     if (!data.data) return null;
-
     const iframeHtml = Buffer.from(data.data, 'base64').toString('utf-8');
     const srcMatch = iframeHtml.match(/src=["']([^"']+)["']/);
     return srcMatch ? srcMatch[1] : null;
@@ -347,41 +379,38 @@ async function fetchServerUrl(encodedId) {
 // ── ROUTES ───────────────────────────────────
 
 app.get('/', (req, res) => {
-  res.json({
-    name: 'KitsuneID API',
-    version: '2.0.0',
-    status: 'running',
-    endpoints: ['/ongoing', '/complete', '/schedule', '/search', '/anime', '/episode', '/server']
-  });
+  const stats = { total: cache.size, keys: [...cache.keys()] };
+  res.json({ name: 'KitsuneID API', version: '3.0.0', status: 'running', cache: stats,
+    endpoints: ['/ongoing', '/complete', '/schedule', '/search', '/anime', '/episode', '/server', '/cache/clear'] });
+});
+
+// Clear cache endpoint (untuk admin)
+app.get('/cache/clear', (req, res) => {
+  const count = cache.size;
+  cache.clear();
+  res.json({ message: `Cache cleared: ${count} items removed` });
 });
 
 app.get('/ongoing', async (req, res) => {
-  try {
-    const animes = await scrapeOngoing(parseInt(req.query.page) || 1);
-    res.json({ animes });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  try { res.json({ animes: await scrapeOngoing(parseInt(req.query.page) || 1) }); }
+  catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/complete', async (req, res) => {
-  try {
-    const animes = await scrapeComplete(parseInt(req.query.page) || 1);
-    res.json({ animes });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  try { res.json({ animes: await scrapeComplete(parseInt(req.query.page) || 1) }); }
+  catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/schedule', async (req, res) => {
-  try {
-    const schedules = await scrapeSchedule();
-    res.json({ schedules });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  try { res.json({ schedules: await scrapeSchedule() }); }
+  catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/search', async (req, res) => {
   try {
     const q = req.query.q;
     if (!q) return res.status(400).json({ error: 'query diperlukan' });
-    const results = await scrapeSearch(q);
-    res.json({ results });
+    res.json({ results: await scrapeSearch(q) });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -389,8 +418,7 @@ app.get('/anime', async (req, res) => {
   try {
     const slug = req.query.slug;
     if (!slug) return res.status(400).json({ error: 'slug diperlukan' });
-    const data = await scrapeAnimeDetail(slug);
-    res.json(data);
+    res.json(await scrapeAnimeDetail(slug));
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -398,8 +426,7 @@ app.get('/episode', async (req, res) => {
   try {
     const slug = req.query.slug;
     if (!slug) return res.status(400).json({ error: 'slug diperlukan' });
-    const data = await scrapeEpisode(slug);
-    res.json(data);
+    res.json(await scrapeEpisode(slug));
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -407,12 +434,8 @@ app.get('/server', async (req, res) => {
   try {
     const id = req.query.id;
     if (!id) return res.status(400).json({ error: 'id diperlukan' });
-    const url = await fetchServerUrl(id);
-    res.json({ url });
+    res.json({ url: await fetchServerUrl(id) });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── START ─────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`🦊 KitsuneID API running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🦊 KitsuneID API v3 running on port ${PORT}`));
