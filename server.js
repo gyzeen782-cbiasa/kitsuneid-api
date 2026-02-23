@@ -6,47 +6,25 @@ const http = require('http');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const BASE = 'https://otakudesu.best'; // domain cadangan, lebih jarang diblokir
+const BASE = 'https://otakudesu.best';
+const SCRAPER_KEY = '2ae12f2df6c0a613015482e8131a38ab';
 
 app.use(cors());
 app.use(express.json());
 
 // ── HTTP helpers ─────────────────────────────
-function fetchHTML(url, extraHeaders = {}) {
+function fetchHTML(url) {
   return new Promise((resolve, reject) => {
-    const lib = url.startsWith('https') ? https : http;
-    const req = lib.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 11; Redmi Note 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Cache-Control': 'no-cache',
-        ...extraHeaders
-      }
-    }, (res) => {
+    const proxyUrl = `http://api.scraperapi.com?api_key=${SCRAPER_KEY}&url=${encodeURIComponent(url)}&render=false`;
+    http.get(proxyUrl, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        const loc = res.headers.location.startsWith('http')
-          ? res.headers.location : BASE + res.headers.location;
-        return fetchHTML(loc, extraHeaders).then(resolve).catch(reject);
+        return fetchHTML(res.headers.location).then(resolve).catch(reject);
       }
-      // Handle gzip
-      let output = res;
-      const zlib = require('zlib');
-      const encoding = res.headers['content-encoding'];
-      if (encoding === 'gzip') output = res.pipe(zlib.createGunzip());
-      else if (encoding === 'br') output = res.pipe(zlib.createBrotliDecompress());
-      else if (encoding === 'deflate') output = res.pipe(zlib.createInflate());
-
       const chunks = [];
-      output.on('data', c => chunks.push(c));
-      output.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
-      output.on('error', reject);
-    });
-    req.on('error', reject);
-    req.setTimeout(20000, () => { req.destroy(); reject(new Error('Timeout')); });
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+      res.on('error', reject);
+    }).on('error', reject);
   });
 }
 
@@ -170,24 +148,20 @@ async function scrapeAnimeDetail(slug) {
   const thumb = getSrc(doc.querySelector('.fotoanime img'))
     || attr(doc.querySelector('meta[property="og:image"]'), 'content');
 
-  // Sinopsis — coba semua selector
   let synopsis = '';
   const synParas = doc.querySelectorAll('.sinopc p');
   if (synParas.length) synopsis = synParas.map(p => txt(p)).filter(Boolean).join(' ');
   if (!synopsis) synopsis = txt(doc.querySelector('.sinopc')) || txt(doc.querySelector('.sinom')) || 'Tidak ada sinopsis.';
 
-  // Info detail
   const infoBolds = doc.querySelectorAll('.infozingle b');
   const getInfo = idx => {
     const b = infoBolds[idx];
     return b ? b.parentNode.text.replace(b.text, '').replace(':', '').trim() : null;
   };
 
-  // Genre
   const genreEls = doc.querySelector('.infozingle')?.lastElementChild?.querySelectorAll('a') || [];
   const genres = genreEls.map(x => txt(x)).filter(Boolean);
 
-  // Episodes — ambil dari smokelister
   const episodes = [];
   for (const block of doc.querySelectorAll('.smokelister')) {
     const bt = block.text.toLowerCase();
@@ -224,13 +198,10 @@ async function scrapeEpisode(epSlug) {
   const html = await fetchHTML(url);
   const doc = parse(html);
 
-  // ── Ambil credentials dari JS inline ─────
   const scripts = doc.querySelectorAll('script').map(s => s.text).join('\n');
   const actionMatches = [...scripts.matchAll(/action\s*[:=]\s*["']([^"']+)["']/g)].map(m => m[1]);
   const uniqueActions = [...new Set(actionMatches)];
-  // uniqueActions[0] = main action, uniqueActions[1] = nonce action
 
-  // ── Ambil nonce ───────────────────────────
   let nonce = '';
   const nonceAction = uniqueActions.find(a => a.toLowerCase().includes('nonce'));
   const mainAction = uniqueActions.find(a => !a.toLowerCase().includes('nonce') && a !== nonceAction);
@@ -247,10 +218,8 @@ async function scrapeEpisode(epSlug) {
     }
   }
 
-  // ── Kumpulkan server dari mirrorstream ────
   const servers = [];
 
-  // Cek player langsung dulu
   const defaultIframe = doc.querySelector('.player-embed iframe')
     || doc.querySelector('#pembed iframe')
     || doc.querySelector('iframe[src*="embed"]');
@@ -261,7 +230,6 @@ async function scrapeEpisode(epSlug) {
     }
   }
 
-  // Mirror server dengan data-content
   doc.querySelectorAll('.mirrorstream > ul').forEach(ul => {
     const quality = txt(ul.previousElementSibling) || 'HD';
     ul.querySelectorAll('li a[data-content]').forEach(link => {
@@ -270,7 +238,6 @@ async function scrapeEpisode(epSlug) {
       if (!serverId) return;
       try {
         const raw = JSON.parse(Buffer.from(serverId, 'base64').toString('utf-8'));
-        // Gabungkan dengan nonce & action
         const enriched = { ...raw, nonce, referer: url };
         if (mainAction && !enriched.action) enriched.action = mainAction;
         const encodedId = Buffer.from(JSON.stringify(enriched)).toString('base64');
@@ -284,7 +251,6 @@ async function scrapeEpisode(epSlug) {
     });
   });
 
-  // Navigasi episode
   let prevEp = null, nextEp = null;
   doc.querySelectorAll('.flir a').forEach(link => {
     const t = txt(link).toLowerCase();
