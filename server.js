@@ -284,21 +284,24 @@ async function scrapeEpisode(epSlug) {
   if (cached) { console.log('Cache hit:', cacheKey); return cached; }
 
   const url = `${BASE}/episode/${epSlug}/`;
-  console.log('Fetching episode with render=true:', epSlug);
-  const html = await fetchHTMLRendered(url);
+  console.log('Fetching episode:', epSlug);
+
+  // Pakai render=false dulu — lebih cepat, cukup untuk ambil default player + mirrorstream
+  const html = await fetchHTML(url);
   const doc = parse(html);
+  const innerText = doc.innerText || doc.text || '';
 
-  const scripts = doc.querySelectorAll('script').map(s => s.text).join('\n');
-  const actionMatches = [...scripts.matchAll(/action\s*[:=]\s*["']([^"']+)["']/g)].map(m => m[1]);
-  const uniqueActions = [...new Set(actionMatches)];
+  // Ambil action credentials dari inline JS
+  const credentials = [...new Set(
+    [...innerText.matchAll(/action:"([^"]+)"/g)].map(m => m[1])
+  )];
+  // credentials[0] = main action, credentials[1] = nonce action
 
+  // Ambil nonce
   let nonce = '';
-  const nonceAction = uniqueActions.find(a => a.toLowerCase().includes('nonce'));
-  const mainAction = uniqueActions.find(a => !a.toLowerCase().includes('nonce') && a !== nonceAction);
-
-  if (nonceAction) {
+  if (credentials[1]) {
     try {
-      const nonceBody = new URLSearchParams({ action: nonceAction }).toString();
+      const nonceBody = new URLSearchParams({ action: credentials[1] }).toString();
       const nonceRes = await fetchPost(`${BASE}/wp-admin/admin-ajax.php`, nonceBody, url);
       const nonceJson = JSON.parse(nonceRes);
       nonce = nonceJson.data || '';
@@ -308,32 +311,42 @@ async function scrapeEpisode(epSlug) {
 
   const servers = [];
 
+  // Default player iframe — ini yang paling sering langsung bisa diputar
   const defaultIframe = doc.querySelector('.player-embed iframe')
     || doc.querySelector('#pembed iframe')
-    || doc.querySelector('iframe[src*="embed"]')
-    || doc.querySelector('iframe[src*="video"]');
+    || doc.querySelector('iframe[src]');
   if (defaultIframe) {
     const iSrc = getSrc(defaultIframe);
     if (iSrc && iSrc.startsWith('http')) {
-      servers.push({ name: 'Default', url: iSrc, quality: 'HD', serverName: 'Default' });
+      servers.push({ name: 'Default', url: iSrc });
+      console.log('Default iframe found:', iSrc.slice(0, 60));
     }
   }
 
-  doc.querySelectorAll('.mirrorstream li a[data-content]').forEach((link, i) => {
-    const serverId = attr(link, 'data-content');
-    const serverName = txt(link) || ('Server ' + (i + 1));
-    if (!serverId) return;
-    try {
-      const raw = JSON.parse(Buffer.from(serverId, 'base64').toString('utf-8'));
-      const enriched = { ...raw, nonce, referer: url };
-      if (mainAction && !enriched.action) enriched.action = mainAction;
-      const encodedId = Buffer.from(JSON.stringify(enriched)).toString('base64');
-      servers.push({ name: serverName, serverId: encodedId, needsPost: true });
-    } catch(e) {
-      servers.push({ name: serverName, serverId, needsPost: true });
-    }
+  // Mirror servers — sebagai opsi tambahan
+  doc.querySelectorAll('.mirrorstream > ul').forEach(ul => {
+    const quality = txt(ul.previousElementSibling) || 'HD';
+    ul.querySelectorAll('li a[data-content]').forEach(link => {
+      const serverId = attr(link, 'data-content');
+      const serverName = txt(link);
+      if (!serverId) return;
+      try {
+        const decoded = JSON.parse(Buffer.from(serverId, 'base64').toString('utf-8'));
+        const enriched = {
+          ...decoded,
+          nonce,
+          action: credentials[0] || decoded.action || '',
+          referer: url,
+        };
+        const encodedId = Buffer.from(JSON.stringify(enriched)).toString('base64');
+        servers.push({ name: `${quality} - ${serverName}`, serverId: encodedId, needsPost: true });
+      } catch(e) {
+        servers.push({ name: `${quality} - ${serverName}`, serverId, needsPost: true });
+      }
+    });
   });
 
+  // Navigasi prev/next episode
   let prevEp = null, nextEp = null;
   doc.querySelectorAll('.flir a').forEach(link => {
     const t = txt(link).toLowerCase();
@@ -342,9 +355,8 @@ async function scrapeEpisode(epSlug) {
   });
 
   const result = { servers, prevEp, nextEp };
-  // Cache episode lebih pendek karena nonce bisa expired
   setCache(cacheKey, result, CACHE_TTL.episode);
-  console.log(`Episode ${epSlug}: ${servers.length} servers found`);
+  console.log(`Episode ${epSlug}: ${servers.length} server(s) found`);
   return result;
 }
 
