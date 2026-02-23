@@ -1,4 +1,4 @@
-// ===== server.js — KitsuneID API (Railway) =====
+// ===== server.js — KitsuneID API (Railway) v2 =====
 const express = require('express');
 const cors = require('cors');
 const https = require('https');
@@ -13,12 +13,30 @@ app.use(cors());
 app.use(express.json());
 
 // ── HTTP helpers ─────────────────────────────
+
+// render=false → cepat, untuk listing/detail
 function fetchHTML(url) {
   return new Promise((resolve, reject) => {
     const proxyUrl = `http://api.scraperapi.com?api_key=${SCRAPER_KEY}&url=${encodeURIComponent(url)}&render=false`;
-    http.get(proxyUrl, (res) => {
+    http.get(proxyUrl, { timeout: 30000 }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return fetchHTML(res.headers.location).then(resolve).catch(reject);
+      }
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+      res.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+// render=true → untuk episode agar JS dieksekusi, player muncul
+function fetchHTMLRendered(url) {
+  return new Promise((resolve, reject) => {
+    const proxyUrl = `http://api.scraperapi.com?api_key=${SCRAPER_KEY}&url=${encodeURIComponent(url)}&render=true`;
+    http.get(proxyUrl, { timeout: 60000 }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return fetchHTMLRendered(res.headers.location).then(resolve).catch(reject);
       }
       const chunks = [];
       res.on('data', c => chunks.push(c));
@@ -67,6 +85,16 @@ const toSlug = url => url
   .replace(BASE, '')
   .replace(/^\/(anime|episode)\//, '')
   .replace(/\/$/, '');
+
+// FIX #1 — Parse nomor episode yang benar
+// Cari "Episode X" dulu, fallback ke angka terakhir di judul
+function parseEpNum(title, fallback) {
+  if (!title) return fallback;
+  const epMatch = title.match(/episode\s+(\d+)/i) || title.match(/\bep\.?\s*(\d+)/i);
+  if (epMatch) return epMatch[1];
+  const nums = title.match(/\d+/g);
+  return nums ? nums[nums.length - 1] : fallback;
+}
 
 // ── SCRAPERS ─────────────────────────────────
 
@@ -148,10 +176,17 @@ async function scrapeAnimeDetail(slug) {
   const thumb = getSrc(doc.querySelector('.fotoanime img'))
     || attr(doc.querySelector('meta[property="og:image"]'), 'content');
 
+  // FIX #3 — Synopsis: coba lebih banyak selector
   let synopsis = '';
-  const synParas = doc.querySelectorAll('.sinopc p');
-  if (synParas.length) synopsis = synParas.map(p => txt(p)).filter(Boolean).join(' ');
-  if (!synopsis) synopsis = txt(doc.querySelector('.sinopc')) || txt(doc.querySelector('.sinom')) || 'Tidak ada sinopsis.';
+  const synSelectors = ['.sinopc p', '.sinopc', '.sinom p', '.sinom', '.entry-content p', '[itemprop="description"]'];
+  for (const sel of synSelectors) {
+    const els = doc.querySelectorAll(sel);
+    if (els.length) {
+      synopsis = els.map(e => txt(e)).filter(t => t.length > 20).join(' ');
+      if (synopsis) break;
+    }
+  }
+  if (!synopsis) synopsis = 'Tidak ada sinopsis.';
 
   const infoBolds = doc.querySelectorAll('.infozingle b');
   const getInfo = idx => {
@@ -162,6 +197,7 @@ async function scrapeAnimeDetail(slug) {
   const genreEls = doc.querySelector('.infozingle')?.lastElementChild?.querySelectorAll('a') || [];
   const genres = genreEls.map(x => txt(x)).filter(Boolean);
 
+  // FIX #1 — Nomor episode yang benar
   const episodes = [];
   for (const block of doc.querySelectorAll('.smokelister')) {
     const bt = block.text.toLowerCase();
@@ -170,12 +206,13 @@ async function scrapeAnimeDetail(slug) {
       epLinks.forEach((link, i) => {
         const epUrl = getHref(link);
         const epTitle = txt(link);
-        const num = epTitle.match(/(\d+)/);
         const epSlug = toSlug(epUrl);
         if (epSlug) {
           episodes.push({
-            title: epTitle, slug: epSlug, url: epUrl,
-            episode: num ? num[1] : String(i + 1)
+            title: epTitle,
+            slug: epSlug,
+            url: epUrl,
+            episode: parseEpNum(epTitle, String(i + 1))
           });
         }
       });
@@ -195,7 +232,10 @@ async function scrapeAnimeDetail(slug) {
 
 async function scrapeEpisode(epSlug) {
   const url = `${BASE}/episode/${epSlug}/`;
-  const html = await fetchHTML(url);
+
+  // FIX #2 — render=true agar JS dieksekusi dan player muncul
+  console.log('Fetching episode with render=true:', epSlug);
+  const html = await fetchHTMLRendered(url);
   const doc = parse(html);
 
   const scripts = doc.querySelectorAll('script').map(s => s.text).join('\n');
@@ -220,21 +260,29 @@ async function scrapeEpisode(epSlug) {
 
   const servers = [];
 
+  // Cek direct iframe dulu
   const defaultIframe = doc.querySelector('.player-embed iframe')
     || doc.querySelector('#pembed iframe')
-    || doc.querySelector('iframe[src*="embed"]');
+    || doc.querySelector('iframe[src*="embed"]')
+    || doc.querySelector('iframe[src*="video"]');
   if (defaultIframe) {
     const iSrc = getSrc(defaultIframe);
     if (iSrc && iSrc.startsWith('http')) {
-      servers.push({ name: 'Default', url: iSrc, quality: 'HD' });
+      servers.push({ name: 'Default', url: iSrc, quality: 'HD', serverName: 'Default' });
     }
   }
 
+  // FIX #4 — Parse kualitas resolusi dengan benar (720p, 480p, dll)
   doc.querySelectorAll('.mirrorstream > ul').forEach(ul => {
-    const quality = txt(ul.previousElementSibling) || 'HD';
+    const prevEl = ul.previousElementSibling;
+    const qualityRaw = txt(prevEl) || '';
+    // Ekstrak pola resolusi: 1080p, 720p, 480p, 360p
+    const qualityMatch = qualityRaw.match(/(\d{3,4}p)/i);
+    const quality = qualityMatch ? qualityMatch[1] : (qualityRaw || 'HD');
+
     ul.querySelectorAll('li a[data-content]').forEach(link => {
       const serverId = attr(link, 'data-content');
-      const serverName = txt(link);
+      const serverName = txt(link); // GDrive, Zippyshare, dll
       if (!serverId) return;
       try {
         const raw = JSON.parse(Buffer.from(serverId, 'base64').toString('utf-8'));
@@ -243,10 +291,16 @@ async function scrapeEpisode(epSlug) {
         const encodedId = Buffer.from(JSON.stringify(enriched)).toString('base64');
         servers.push({
           name: `${quality} - ${serverName}`,
-          quality, serverId: encodedId, needsPost: true,
+          quality,       // "720p"
+          serverName,    // "GDrive"
+          serverId: encodedId,
+          needsPost: true,
         });
       } catch(e) {
-        servers.push({ name: `${quality} - ${serverName}`, quality, serverId, needsPost: true });
+        servers.push({
+          name: `${quality} - ${serverName}`,
+          quality, serverName, serverId, needsPost: true
+        });
       }
     });
   });
@@ -261,6 +315,7 @@ async function scrapeEpisode(epSlug) {
     }
   });
 
+  console.log(`Episode ${epSlug}: ${servers.length} servers found`);
   return { servers, prevEp, nextEp };
 }
 
@@ -294,7 +349,7 @@ async function fetchServerUrl(encodedId) {
 app.get('/', (req, res) => {
   res.json({
     name: 'KitsuneID API',
-    version: '1.0.0',
+    version: '2.0.0',
     status: 'running',
     endpoints: ['/ongoing', '/complete', '/schedule', '/search', '/anime', '/episode', '/server']
   });
