@@ -6,7 +6,7 @@ const http = require('http');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const BASE = 'https://otakudesu.cloud'; // domain cadangan, lebih jarang diblokir
+const BASE = 'https://otakudesu.best'; // domain cadangan, lebih jarang diblokir
 
 app.use(cors());
 app.use(express.json());
