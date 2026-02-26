@@ -179,15 +179,86 @@ async function scrapeSchedule() {
   const cached = getCache('schedule');
   if (cached) { console.log('Cache hit: schedule'); return cached; }
 
-  const doc = parse(await fetchHTML(`${BASE}/jadwal-rilis/`));
+  const html = await fetchHTML(`${BASE}/jadwal-rilis/`);
+  const doc = parse(html);
   const schedules = [];
-  doc.querySelectorAll('.kglist321').forEach(block => {
-    const day = txt(block.querySelector('h2'));
-    const animeList = block.querySelectorAll('ul li a').map(a2 => ({
-      title: txt(a2), slug: toSlug(getHref(a2)), url: getHref(a2)
-    }));
-    if (day) schedules.push({ day, animeList });
-  });
+
+  // Coba berbagai selector karena otakudesu sering ganti struktur
+  const selectors = [
+    '.kglist321',
+    '.scheduleday',
+    '.jadwal-list',
+    '[class*="schedule"]',
+    '[class*="jadwal"]',
+    '.venz',
+  ];
+
+  let found = false;
+
+  // Coba selector utama dulu
+  for (const sel of selectors) {
+    const blocks = doc.querySelectorAll(sel);
+    if (!blocks.length) continue;
+
+    blocks.forEach(block => {
+      // Cari nama hari dari heading apapun
+      const dayEl = block.querySelector('h2') || block.querySelector('h3')
+        || block.querySelector('.hari') || block.querySelector('[class*="day"]')
+        || block.querySelector('strong');
+      const day = txt(dayEl);
+      if (!day) return;
+
+      const links = block.querySelectorAll('a');
+      const animeList = [];
+      links.forEach(a2 => {
+        const href = getHref(a2);
+        const title = txt(a2);
+        if (!href || !title) return;
+        const slug = toSlug(href);
+        if (slug) animeList.push({ title, slug, url: href });
+      });
+
+      if (animeList.length > 0) {
+        schedules.push({ day, animeList });
+        found = true;
+      }
+    });
+
+    if (found) {
+      console.log(`Schedule: found ${schedules.length} days using selector "${sel}"`);
+      break;
+    }
+  }
+
+  // Fallback: cari semua heading h2 yang mengandung nama hari
+  if (!found) {
+    console.log('Schedule: trying heading-based fallback...');
+    const dayNames = ['senin','selasa','rabu','kamis','jumat','sabtu','minggu',
+                      'monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
+    const allH2 = doc.querySelectorAll('h2, h3');
+
+    allH2.forEach(h => {
+      const dayText = txt(h).toLowerCase();
+      const isDay = dayNames.some(d => dayText.includes(d));
+      if (!isDay) return;
+
+      // Ambil semua link setelah heading ini sampai heading berikutnya
+      const animeList = [];
+      let next = h.nextElementSibling;
+      while (next && !['H2','H3'].includes(next.tagName)) {
+        next.querySelectorAll('a').forEach(a2 => {
+          const href = getHref(a2);
+          const title = txt(a2);
+          if (href && title) animeList.push({ title, slug: toSlug(href), url: href });
+        });
+        next = next.nextElementSibling;
+      }
+      if (animeList.length > 0) schedules.push({ day: txt(h), animeList });
+    });
+
+    if (schedules.length) console.log(`Schedule fallback: found ${schedules.length} days`);
+    else console.log('Schedule: no data found, HTML preview:', html.slice(0, 500));
+  }
 
   setCache('schedule', schedules, CACHE_TTL.schedule);
   return schedules;
@@ -390,6 +461,11 @@ app.get('/', (req, res) => {
 });
 
 // Clear cache endpoint (untuk admin)
+// Ping endpoint untuk keep-alive
+app.get('/ping', (req, res) => {
+  res.json({ pong: true, time: new Date().toISOString(), cache: cache.size });
+});
+
 app.get('/cache/clear', (req, res) => {
   const count = cache.size;
   cache.clear();
@@ -443,4 +519,34 @@ app.get('/server', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.listen(PORT, () => console.log(`🦊 KitsuneID API v3 running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🦊 KitsuneID API v3 running on port ${PORT}`);
+
+  // ── KEEP-ALIVE: ping diri sendiri setiap 4 menit ──
+  // Railway tidur setelah ~5 menit idle — ping ini mencegahnya
+  const SELF_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/ping`
+    : `http://localhost:${PORT}/ping`;
+
+  setInterval(() => {
+    const mod = SELF_URL.startsWith('https') ? https : http;
+    mod.get(SELF_URL, res => {
+      console.log(`[keep-alive] ping → ${res.statusCode}`);
+    }).on('error', e => {
+      console.log('[keep-alive] ping error:', e.message);
+    });
+  }, 4 * 60 * 1000); // setiap 4 menit
+
+  // ── WARM-UP: pre-load cache ongoing & schedule saat startup ──
+  setTimeout(async () => {
+    try {
+      console.log('[warm-up] Pre-loading ongoing cache...');
+      await scrapeOngoing(1);
+      console.log('[warm-up] Pre-loading schedule cache...');
+      await scrapeSchedule();
+      console.log('[warm-up] Done!');
+    } catch(e) {
+      console.log('[warm-up] Error:', e.message);
+    }
+  }, 3000); // tunggu 3 detik setelah server ready
+});
