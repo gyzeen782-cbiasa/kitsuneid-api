@@ -6,7 +6,7 @@ const http = require('http');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const BASE = 'https://otakudesu.fit';
+const BASE = 'https://otakudesu.pl';
 const SCRAPER_KEY = '2ae12f2df6c0a613015482e8131a38ab';
 
 app.use(cors());
