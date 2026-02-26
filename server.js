@@ -44,18 +44,21 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 // ── HTTP helpers ─────────────────────────────
-function fetchHTML(url) {
+function fetchHTML(url, render = false) {
   return new Promise((resolve, reject) => {
-    const proxyUrl = `http://api.scraperapi.com?api_key=${SCRAPER_KEY}&url=${encodeURIComponent(url)}&render=false`;
-    http.get(proxyUrl, { timeout: 30000 }, (res) => {
+    const proxyUrl = `http://api.scraperapi.com?api_key=${SCRAPER_KEY}&url=${encodeURIComponent(url)}&render=${render}`;
+    http.get(proxyUrl, { timeout: 45000 }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return fetchHTML(res.headers.location).then(resolve).catch(reject);
+        return fetchHTML(res.headers.location, render).then(resolve).catch(reject);
       }
       const chunks = [];
       res.on('data', c => chunks.push(c));
       res.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
       res.on('error', reject);
-    }).on('error', reject);
+    }).on('error', reject).setTimeout(45000, function() {
+      this.destroy();
+      reject(new Error('Request timeout'));
+    });
   });
 }
 
@@ -130,7 +133,7 @@ async function scrapeOngoing(page = 1) {
   if (cached) { console.log('Cache hit:', cacheKey); return cached; }
 
   const url = page > 1 ? `${BASE}/ongoing-anime/page/${page}/` : `${BASE}/ongoing-anime/`;
-  const doc = parse(await fetchHTML(url));
+  const doc = parse(await fetchHTML(url, true));
   const animes = [];
   doc.querySelectorAll('.venz ul li').forEach(li => {
     const a = li.querySelector('a');
@@ -156,7 +159,7 @@ async function scrapeComplete(page = 1) {
   if (cached) { console.log('Cache hit:', cacheKey); return cached; }
 
   const url = page > 1 ? `${BASE}/complete-anime/page/${page}/` : `${BASE}/complete-anime/`;
-  const doc = parse(await fetchHTML(url));
+  const doc = parse(await fetchHTML(url, true));
   const animes = [];
   doc.querySelectorAll('.venz ul li').forEach(li => {
     const a = li.querySelector('a');
@@ -183,104 +186,71 @@ async function scrapeSchedule() {
   const doc = parse(html);
   const schedules = [];
 
-  const dayNames = ['senin','selasa','rabu','kamis','jumat','sabtu','minggu'];
-  const dayNamesEn = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
+  // .kglist321 terbukti ada dari debug — pakai ini
+  const blocks = doc.querySelectorAll('.kglist321');
+  console.log(`Schedule: found ${blocks.length} .kglist321 blocks`);
 
-  function isDay(text) {
-    const t = text.toLowerCase().trim();
-    return dayNames.some(d => t === d || t.startsWith(d)) ||
-           dayNamesEn.some(d => t === d || t.startsWith(d));
-  }
+  blocks.forEach(block => {
+    const day = txt(block.querySelector('h2') || block.querySelector('h3'));
+    if (!day) return;
 
-  // ── Approach 1: class-based blocks ───────────
-  const blockSelectors = ['.kglist321','[class*="schedule"]','[class*="jadwal"]',
-    '[class*="hari"]','[class*="day-"]','.tab-content','.schedule-list'];
-
-  for (const sel of blockSelectors) {
-    const blocks = doc.querySelectorAll(sel);
-    if (!blocks.length) continue;
-    blocks.forEach(block => {
-      const headings = block.querySelectorAll('h2,h3,h4,.title,.heading');
-      headings.forEach(h => {
-        const day = txt(h);
-        if (!isDay(day)) return;
-        const animeList = [];
-        block.querySelectorAll('a').forEach(a2 => {
-          const href = getHref(a2);
-          const title = txt(a2);
-          if (href && title && href.includes('/anime/')) {
-            animeList.push({ title, slug: toSlug(href), url: href });
-          }
-        });
-        if (animeList.length) schedules.push({ day, animeList });
-      });
-    });
-    if (schedules.length) {
-      console.log(`Schedule: ${schedules.length} days via "${sel}"`);
-      break;
-    }
-  }
-
-  // ── Approach 2: heading scan ──────────────────
-  if (!schedules.length) {
-    const allHeadings = doc.querySelectorAll('h1,h2,h3,h4,h5,strong,b,th,td,li,span,div');
-    allHeadings.forEach(h => {
-      const day = txt(h);
-      if (!isDay(day) || day.length > 15) return;
-      const animeList = [];
-      // Scan sibling dan children
-      const parent = h.parentNode;
-      if (parent) {
-        parent.querySelectorAll('a').forEach(a2 => {
-          const href = getHref(a2);
-          const title = txt(a2);
-          if (href && title && href.includes('/anime/')) {
-            animeList.push({ title, slug: toSlug(href), url: href });
-          }
-        });
-      }
-      // Scan next siblings
-      let next = h.nextElementSibling;
-      let safety = 0;
-      while (next && safety++ < 10) {
-        next.querySelectorAll('a').forEach(a2 => {
-          const href = getHref(a2);
-          const title = txt(a2);
-          if (href && title && href.includes('/anime/')) {
-            animeList.push({ title, slug: toSlug(href), url: href });
-          }
-        });
-        next = next.nextElementSibling;
-      }
-      if (animeList.length && !schedules.find(s => s.day === day)) {
-        schedules.push({ day, animeList });
-      }
-    });
-    if (schedules.length) console.log(`Schedule: ${schedules.length} days via heading-scan`);
-  }
-
-  // ── Approach 3: extract semua anime link, group by context ─────
-  if (!schedules.length) {
-    console.log('Schedule: all approaches failed, trying link extraction...');
-    // Ambil semua link /anime/ dari halaman jadwal, tandai hari berdasarkan posisi
-    const allLinks = doc.querySelectorAll('a[href*="/anime/"]');
-    const tempMap = {};
-    let currentDay = 'Tidak Diketahui';
-    allLinks.forEach(a2 => {
+    const animeList = [];
+    // Ambil semua link di dalam block — tidak filter /anime/ karena jadwal pakai link /anime/
+    block.querySelectorAll('ul li a').forEach(a2 => {
       const href = getHref(a2);
       const title = txt(a2);
-      if (!href || !title) return;
-      if (!tempMap[currentDay]) tempMap[currentDay] = [];
-      tempMap[currentDay].push({ title, slug: toSlug(href), url: href });
+      if (href && title) {
+        animeList.push({ title, slug: toSlug(href), url: href });
+      }
     });
-    Object.entries(tempMap).forEach(([day, animeList]) => {
-      if (animeList.length) schedules.push({ day, animeList });
-    });
-    console.log('Schedule link-extract:', schedules.length, 'groups, HTML length:', html.length);
-  }
+
+    // Fallback: kalau ul li a kosong, coba semua a
+    if (!animeList.length) {
+      block.querySelectorAll('a').forEach(a2 => {
+        const href = getHref(a2);
+        const title = txt(a2);
+        if (href && title) {
+          animeList.push({ title, slug: toSlug(href), url: href });
+        }
+      });
+    }
+
+    console.log(`  Day: "${day}" → ${animeList.length} anime`);
+    schedules.push({ day, animeList });
+  });
 
   if (!schedules.length) {
-    console.log('Schedule: COMPLETELY EMPTY. HTML snippet:', html.slice(200, 800));
+    // Fallback: scan semua a[href*="/anime/"] di halaman
+    console.log('Schedule: .kglist321 empty, scanning all anime links...');
+    const allLinks = doc.querySelectorAll('a');
+    const dayMap = {};
+    let curDay = null;
+
+    // Cari h2 yang berisi nama hari
+    const dayNames = ['senin','selasa','rabu','kamis','jumat','sabtu','minggu'];
+    doc.querySelectorAll('h2').forEach(h => {
+      const t = txt(h).toLowerCase().trim();
+      if (dayNames.some(d => t.includes(d))) {
+        curDay = txt(h);
+        dayMap[curDay] = [];
+        // Ambil semua link di parent/sibling
+        const parent = h.parentNode;
+        if (parent) {
+          parent.querySelectorAll('a').forEach(a2 => {
+            const href = getHref(a2);
+            const title = txt(a2);
+            if (href && title && href !== '#') {
+              dayMap[curDay].push({ title, slug: toSlug(href), url: href });
+            }
+          });
+        }
+      }
+    });
+
+    Object.entries(dayMap).forEach(([day, list]) => {
+      if (list.length) schedules.push({ day, animeList: list });
+    });
+    console.log('Schedule fallback result:', schedules.length, 'days');
   }
 
   setCache('schedule', schedules, CACHE_TTL.schedule);
@@ -312,7 +282,7 @@ async function scrapeAnimeDetail(slug) {
   const cached = getCache(cacheKey);
   if (cached) { console.log('Cache hit:', cacheKey); return cached; }
 
-  const html = await fetchHTML(`${BASE}/anime/${slug}/`);
+  const html = await fetchHTML(`${BASE}/anime/${slug}/`, true);
   const doc = parse(html);
 
   // Title - multi-selector fallback
@@ -433,8 +403,8 @@ async function scrapeEpisode(epSlug) {
   const url = `${BASE}/episode/${epSlug}/`;
   console.log('Fetching episode:', epSlug);
 
-  // Pakai render=false dulu — lebih cepat, cukup untuk ambil default player + mirrorstream
-  const html = await fetchHTML(url);
+  // Pakai render=true agar JavaScript player ter-render (penting untuk video)
+  const html = await fetchHTML(url, true);
   const doc = parse(html);
   const innerText = doc.innerText || doc.text || '';
 
