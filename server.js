@@ -6,7 +6,7 @@ const http = require('http');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const BASE = 'https://otakudesu.best';
+const BASE = 'https://otakudesu.fit';
 const SCRAPER_KEY = '2ae12f2df6c0a613015482e8131a38ab';
 
 app.use(cors());
@@ -133,7 +133,7 @@ async function scrapeOngoing(page = 1) {
   if (cached) { console.log('Cache hit:', cacheKey); return cached; }
 
   const url = page > 1 ? `${BASE}/ongoing-anime/page/${page}/` : `${BASE}/ongoing-anime/`;
-  const doc = parse(await fetchHTML(url, true));
+  const doc = parse(await fetchHTML(url));
   const animes = [];
   doc.querySelectorAll('.venz ul li').forEach(li => {
     const a = li.querySelector('a');
@@ -159,7 +159,7 @@ async function scrapeComplete(page = 1) {
   if (cached) { console.log('Cache hit:', cacheKey); return cached; }
 
   const url = page > 1 ? `${BASE}/complete-anime/page/${page}/` : `${BASE}/complete-anime/`;
-  const doc = parse(await fetchHTML(url, true));
+  const doc = parse(await fetchHTML(url));
   const animes = [];
   doc.querySelectorAll('.venz ul li').forEach(li => {
     const a = li.querySelector('a');
@@ -282,7 +282,7 @@ async function scrapeAnimeDetail(slug) {
   const cached = getCache(cacheKey);
   if (cached) { console.log('Cache hit:', cacheKey); return cached; }
 
-  const html = await fetchHTML(`${BASE}/anime/${slug}/`, true);
+  const html = await fetchHTML(`${BASE}/anime/${slug}/`);
   const doc = parse(html);
 
   // Title - multi-selector fallback
@@ -403,8 +403,8 @@ async function scrapeEpisode(epSlug) {
   const url = `${BASE}/episode/${epSlug}/`;
   console.log('Fetching episode:', epSlug);
 
-  // Pakai render=true agar JavaScript player ter-render (penting untuk video)
-  const html = await fetchHTML(url, true);
+  // Pakai render=false — lebih cepat, hemat quota ScraperAPI
+  const html = await fetchHTML(url);
   const doc = parse(html);
   const innerText = doc.innerText || doc.text || '';
 
