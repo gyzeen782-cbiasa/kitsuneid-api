@@ -183,81 +183,104 @@ async function scrapeSchedule() {
   const doc = parse(html);
   const schedules = [];
 
-  // Coba berbagai selector karena otakudesu sering ganti struktur
-  const selectors = [
-    '.kglist321',
-    '.scheduleday',
-    '.jadwal-list',
-    '[class*="schedule"]',
-    '[class*="jadwal"]',
-    '.venz',
-  ];
+  const dayNames = ['senin','selasa','rabu','kamis','jumat','sabtu','minggu'];
+  const dayNamesEn = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
 
-  let found = false;
+  function isDay(text) {
+    const t = text.toLowerCase().trim();
+    return dayNames.some(d => t === d || t.startsWith(d)) ||
+           dayNamesEn.some(d => t === d || t.startsWith(d));
+  }
 
-  // Coba selector utama dulu
-  for (const sel of selectors) {
+  // ── Approach 1: class-based blocks ───────────
+  const blockSelectors = ['.kglist321','[class*="schedule"]','[class*="jadwal"]',
+    '[class*="hari"]','[class*="day-"]','.tab-content','.schedule-list'];
+
+  for (const sel of blockSelectors) {
     const blocks = doc.querySelectorAll(sel);
     if (!blocks.length) continue;
-
     blocks.forEach(block => {
-      // Cari nama hari dari heading apapun
-      const dayEl = block.querySelector('h2') || block.querySelector('h3')
-        || block.querySelector('.hari') || block.querySelector('[class*="day"]')
-        || block.querySelector('strong');
-      const day = txt(dayEl);
-      if (!day) return;
-
-      const links = block.querySelectorAll('a');
-      const animeList = [];
-      links.forEach(a2 => {
-        const href = getHref(a2);
-        const title = txt(a2);
-        if (!href || !title) return;
-        const slug = toSlug(href);
-        if (slug) animeList.push({ title, slug, url: href });
+      const headings = block.querySelectorAll('h2,h3,h4,.title,.heading');
+      headings.forEach(h => {
+        const day = txt(h);
+        if (!isDay(day)) return;
+        const animeList = [];
+        block.querySelectorAll('a').forEach(a2 => {
+          const href = getHref(a2);
+          const title = txt(a2);
+          if (href && title && href.includes('/anime/')) {
+            animeList.push({ title, slug: toSlug(href), url: href });
+          }
+        });
+        if (animeList.length) schedules.push({ day, animeList });
       });
-
-      if (animeList.length > 0) {
-        schedules.push({ day, animeList });
-        found = true;
-      }
     });
-
-    if (found) {
-      console.log(`Schedule: found ${schedules.length} days using selector "${sel}"`);
+    if (schedules.length) {
+      console.log(`Schedule: ${schedules.length} days via "${sel}"`);
       break;
     }
   }
 
-  // Fallback: cari semua heading h2 yang mengandung nama hari
-  if (!found) {
-    console.log('Schedule: trying heading-based fallback...');
-    const dayNames = ['senin','selasa','rabu','kamis','jumat','sabtu','minggu',
-                      'monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
-    const allH2 = doc.querySelectorAll('h2, h3');
-
-    allH2.forEach(h => {
-      const dayText = txt(h).toLowerCase();
-      const isDay = dayNames.some(d => dayText.includes(d));
-      if (!isDay) return;
-
-      // Ambil semua link setelah heading ini sampai heading berikutnya
+  // ── Approach 2: heading scan ──────────────────
+  if (!schedules.length) {
+    const allHeadings = doc.querySelectorAll('h1,h2,h3,h4,h5,strong,b,th,td,li,span,div');
+    allHeadings.forEach(h => {
+      const day = txt(h);
+      if (!isDay(day) || day.length > 15) return;
       const animeList = [];
+      // Scan sibling dan children
+      const parent = h.parentNode;
+      if (parent) {
+        parent.querySelectorAll('a').forEach(a2 => {
+          const href = getHref(a2);
+          const title = txt(a2);
+          if (href && title && href.includes('/anime/')) {
+            animeList.push({ title, slug: toSlug(href), url: href });
+          }
+        });
+      }
+      // Scan next siblings
       let next = h.nextElementSibling;
-      while (next && !['H2','H3'].includes(next.tagName)) {
+      let safety = 0;
+      while (next && safety++ < 10) {
         next.querySelectorAll('a').forEach(a2 => {
           const href = getHref(a2);
           const title = txt(a2);
-          if (href && title) animeList.push({ title, slug: toSlug(href), url: href });
+          if (href && title && href.includes('/anime/')) {
+            animeList.push({ title, slug: toSlug(href), url: href });
+          }
         });
         next = next.nextElementSibling;
       }
-      if (animeList.length > 0) schedules.push({ day: txt(h), animeList });
+      if (animeList.length && !schedules.find(s => s.day === day)) {
+        schedules.push({ day, animeList });
+      }
     });
+    if (schedules.length) console.log(`Schedule: ${schedules.length} days via heading-scan`);
+  }
 
-    if (schedules.length) console.log(`Schedule fallback: found ${schedules.length} days`);
-    else console.log('Schedule: no data found, HTML preview:', html.slice(0, 500));
+  // ── Approach 3: extract semua anime link, group by context ─────
+  if (!schedules.length) {
+    console.log('Schedule: all approaches failed, trying link extraction...');
+    // Ambil semua link /anime/ dari halaman jadwal, tandai hari berdasarkan posisi
+    const allLinks = doc.querySelectorAll('a[href*="/anime/"]');
+    const tempMap = {};
+    let currentDay = 'Tidak Diketahui';
+    allLinks.forEach(a2 => {
+      const href = getHref(a2);
+      const title = txt(a2);
+      if (!href || !title) return;
+      if (!tempMap[currentDay]) tempMap[currentDay] = [];
+      tempMap[currentDay].push({ title, slug: toSlug(href), url: href });
+    });
+    Object.entries(tempMap).forEach(([day, animeList]) => {
+      if (animeList.length) schedules.push({ day, animeList });
+    });
+    console.log('Schedule link-extract:', schedules.length, 'groups, HTML length:', html.length);
+  }
+
+  if (!schedules.length) {
+    console.log('Schedule: COMPLETELY EMPTY. HTML snippet:', html.slice(200, 800));
   }
 
   setCache('schedule', schedules, CACHE_TTL.schedule);
@@ -292,9 +315,23 @@ async function scrapeAnimeDetail(slug) {
   const html = await fetchHTML(`${BASE}/anime/${slug}/`);
   const doc = parse(html);
 
-  const title = txt(doc.querySelector('h1.entry-title')) || txt(doc.querySelector('h1'));
+  // Title - multi-selector fallback
+  const title = txt(doc.querySelector('h1.entry-title'))
+    || txt(doc.querySelector('h1.title'))
+    || txt(doc.querySelector('.animposx h1'))
+    || txt(doc.querySelector('.entry-title'))
+    || txt(doc.querySelector('h1'))
+    || attr(doc.querySelector('meta[property="og:title"]'), 'content')
+    || 'Tidak diketahui';
+
+  // Thumb - multi-selector fallback
   const thumb = getSrc(doc.querySelector('.fotoanime img'))
-    || attr(doc.querySelector('meta[property="og:image"]'), 'content');
+    || getSrc(doc.querySelector('.imgdesc img'))
+    || getSrc(doc.querySelector('.animeinfo img'))
+    || getSrc(doc.querySelector('.thumb img'))
+    || getSrc(doc.querySelector('img.attachment-post-thumbnail'))
+    || attr(doc.querySelector('meta[property="og:image"]'), 'content')
+    || '';
 
   let synopsis = '';
   const synSelectors = ['.sinopc p', '.sinopc', '.sinom p', '.sinom', '.entry-content p', '[itemprop="description"]'];
@@ -317,6 +354,8 @@ async function scrapeAnimeDetail(slug) {
   const genres = genreEls.map(x => txt(x)).filter(Boolean);
 
   const episodes = [];
+
+  // Approach 1: selector lama .smokelister
   for (const block of doc.querySelectorAll('.smokelister')) {
     const bt = block.text.toLowerCase();
     if (bt.includes('episode') && !bt.includes('batch')) {
@@ -326,15 +365,52 @@ async function scrapeAnimeDetail(slug) {
         const epTitle = txt(link);
         const epSlug = toSlug(epUrl);
         if (epSlug) {
-          episodes.push({
-            title: epTitle, slug: epSlug, url: epUrl,
-            episode: parseEpNum(epTitle, String(i + 1))
-          });
+          episodes.push({ title: epTitle, slug: epSlug, url: epUrl,
+            episode: parseEpNum(epTitle, String(i + 1)) });
         }
       });
-      if (episodes.length > 0) break;
+      if (episodes.length) break;
     }
   }
+
+  // Approach 2: cari semua link /episode/ dari halaman
+  if (!episodes.length) {
+    const epSelectors = [
+      '.episodelist li a', '.episode-list li a', '.eps li a',
+      '[class*="episode"] li a', '[class*="eps"] li a',
+      '.eplister li a', '.eplist li a'
+    ];
+    for (const sel of epSelectors) {
+      const links = doc.querySelectorAll(sel);
+      if (!links.length) continue;
+      links.forEach((link, i) => {
+        const epUrl = getHref(link);
+        const epTitle = txt(link);
+        const epSlug = toSlug(epUrl);
+        if (epSlug && epUrl.includes('/episode/')) {
+          episodes.push({ title: epTitle, slug: epSlug, url: epUrl,
+            episode: parseEpNum(epTitle, String(i + 1)) });
+        }
+      });
+      if (episodes.length) { console.log(`Episodes: found via "${sel}"`); break; }
+    }
+  }
+
+  // Approach 3: scan SEMUA link /episode/ di halaman
+  if (!episodes.length) {
+    const allLinks = doc.querySelectorAll('a[href*="/episode/"]');
+    allLinks.forEach((link, i) => {
+      const epUrl = getHref(link);
+      const epTitle = txt(link);
+      const epSlug = toSlug(epUrl);
+      if (epSlug && !episodes.find(e => e.slug === epSlug)) {
+        episodes.push({ title: epTitle || `Episode ${i+1}`, slug: epSlug, url: epUrl,
+          episode: parseEpNum(epTitle, String(i + 1)) });
+      }
+    });
+    if (episodes.length) console.log(`Episodes: found ${episodes.length} via all-links scan`);
+  }
+
   episodes.reverse();
 
   const result = {
@@ -464,6 +540,32 @@ app.get('/', (req, res) => {
 // Ping endpoint untuk keep-alive
 app.get('/ping', (req, res) => {
   res.json({ pong: true, time: new Date().toISOString(), cache: cache.size });
+});
+
+// Debug endpoint - lihat HTML mentah dari halaman otakudesu
+app.get('/debug', async (req, res) => {
+  const page = req.query.page || 'schedule'; // ?page=schedule atau ?page=anime&slug=xxx
+  try {
+    let url;
+    if (page === 'anime' && req.query.slug) {
+      url = `${BASE}/anime/${req.query.slug}/`;
+    } else if (page === 'episode' && req.query.slug) {
+      url = `${BASE}/episode/${req.query.slug}/`;
+    } else {
+      url = `${BASE}/jadwal-rilis/`;
+    }
+    const html = await fetchHTML(url);
+    // Kirim hanya 3000 karakter awal untuk preview
+    res.json({
+      url,
+      length: html.length,
+      preview: html.slice(0, 3000),
+      // Cari semua class unik dari halaman
+      classes: [...new Set(html.match(/class="([^"]+)"/g) || [])].slice(0, 50)
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/cache/clear', (req, res) => {
