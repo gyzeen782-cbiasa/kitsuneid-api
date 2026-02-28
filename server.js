@@ -1,32 +1,32 @@
-// ===== server.js — KitsuneID API v4 =====
-// Arsitektur: Jikan API (info) + Samehadaku (episode/video)
+// ===== server.js — KitsuneID API v5 =====
+// Arsitektur: Jikan API (info) + Sanka Vollerei (episode/video)
+// Zero ScraperAPI — semua gratis!
 const express = require('express');
 const cors    = require('cors');
 const https   = require('https');
-const http    = require('http');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
 // ── Sumber data ───────────────────────────────
-const JIKAN       = 'https://api.jikan.moe/v4';
-const SAMEHADAKU  = 'https://v1.samehadaku.how';
-const SCRAPER_KEY = '2ae12f2df6c0a613015482e8131a38ab';
+const JIKAN = 'https://api.jikan.moe/v4';
+const SANKA = 'https://www.sankavollerei.com';
 
 app.use(cors());
 app.use(express.json());
 
-// ── CACHE in-memory ───────────────────────────
+// ── CACHE ─────────────────────────────────────
 const cache = new Map();
 const TTL = {
-  ongoing:  15 * 60 * 1000,  // 15 menit
+  ongoing:  15 * 60 * 1000,
   complete: 15 * 60 * 1000,
-  schedule: 60 * 60 * 1000,  // 1 jam — jadwal jarang berubah
+  schedule: 60 * 60 * 1000,
   search:   10 * 60 * 1000,
-  anime:   120 * 60 * 1000,  // 2 jam — info anime stabil
-  episode:  30 * 60 * 1000,  // 30 menit
+  anime:    60 * 60 * 1000,
+  eplist:   30 * 60 * 1000,
+  episode:  30 * 60 * 1000,
+  server:   60 * 60 * 1000,
 };
-
 function getCache(k) {
   const it = cache.get(k);
   if (!it) return null;
@@ -41,49 +41,40 @@ setInterval(() => {
 
 // ── HTTP helpers ──────────────────────────────
 
-// Jikan: fetch biasa (tidak perlu ScraperAPI)
-function fetchJikan(path) {
+// Fetch JSON dari URL manapun
+function fetchJSON(url, headers = {}) {
   return new Promise((resolve, reject) => {
-    const url = `${JIKAN}${path}`;
-    https.get(url, {
-      headers: { 'Accept': 'application/json', 'User-Agent': 'KitsuneID/4.0' },
+    const mod = url.startsWith('https') ? https : require('http');
+    const req = mod.get(url, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'KitsuneID/5.0',
+        ...headers
+      },
       timeout: 15000
     }, res => {
+      // Ikuti redirect
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return fetchJSON(res.headers.location, headers).then(resolve).catch(reject);
+      }
       const chunks = [];
       res.on('data', c => chunks.push(c));
       res.on('end', () => {
         try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
-        catch(e) { reject(new Error('JSON parse error')); }
+        catch(e) { reject(new Error('JSON parse error: ' + e.message)); }
       });
       res.on('error', reject);
-    }).on('error', reject)
-      .on('timeout', function() { this.destroy(); reject(new Error('Jikan timeout')); });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Request timeout')); });
   });
 }
 
-// Samehadaku: fetch via ScraperAPI (untuk episode/video saja)
-function fetchSamehadaku(path) {
-  return new Promise((resolve, reject) => {
-    const target = `${SAMEHADAKU}${path}`;
-    const proxy  = `http://api.scraperapi.com?api_key=${SCRAPER_KEY}&url=${encodeURIComponent(target)}&render=false`;
-    http.get(proxy, { timeout: 30000 }, res => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return fetchSamehadaku(res.headers.location).then(resolve).catch(reject);
-      }
-      const chunks = [];
-      res.on('data', c => chunks.push(c));
-      res.on('end',  () => resolve(Buffer.concat(chunks).toString('utf-8')));
-      res.on('error', reject);
-    }).on('error', reject)
-      .setTimeout(30000, function() { this.destroy(); reject(new Error('Scraper timeout')); });
-  });
-}
-
-// Jikan rate limiter — max 3 request/detik
+// ── Jikan rate limiter (max 3 req/detik) ─────
 let jikanQueue = [], jikanBusy = false;
-function jikanRateLimit(fn) {
+function jikan(path) {
   return new Promise((res, rej) => {
-    jikanQueue.push({ fn, res, rej });
+    jikanQueue.push({ fn: () => fetchJSON(`${JIKAN}${path}`), res, rej });
     if (!jikanBusy) processJikanQueue();
   });
 }
@@ -92,65 +83,53 @@ async function processJikanQueue() {
   jikanBusy = true;
   const { fn, res, rej } = jikanQueue.shift();
   try { res(await fn()); } catch(e) { rej(e); }
-  setTimeout(processJikanQueue, 340); // ~3 req/detik
+  setTimeout(processJikanQueue, 340);
 }
 
-// Jikan fetch dengan rate limiter
-function jikan(path) {
-  return jikanRateLimit(() => fetchJikan(path));
+// ── Sanka Vollerei fetch ──────────────────────
+function sanka(path) {
+  return fetchJSON(`${SANKA}${path}`);
 }
 
-// ── HTML parser sederhana (untuk Samehadaku) ──
-const { parse } = require('node-html-parser');
-function txt(el) { return el?.text?.trim().replace(/\s+/g, ' ') || ''; }
-function attr(el, a) { return el?.getAttribute(a)?.trim() || ''; }
-function getHref(el) { return attr(el, 'href'); }
-function getSrc(el)  { return attr(el, 'src') || attr(el, 'data-src'); }
+// ══════════════════════════════════════════════
+//   JIKAN — Info anime
+// ══════════════════════════════════════════════
 
-// ── Slug helpers ──────────────────────────────
-// Konversi judul MAL ke slug Samehadaku
 function titleToSlug(title) {
-  return title.toLowerCase()
+  return (title || '').toLowerCase()
     .replace(/[^a-z0-9\s-]/g, '')
     .replace(/\s+/g, '-')
     .replace(/-+/g, '-')
     .trim();
 }
 
-// Format data anime dari Jikan response ke format KitsuneID
 function formatAnime(a) {
   if (!a) return null;
-  const slug = titleToSlug(a.title || a.title_english || '');
   return {
     mal_id:   a.mal_id,
     title:    a.title || a.title_english || 'Unknown',
     titleEn:  a.title_english || '',
-    slug:     slug,
+    slug:     titleToSlug(a.title || ''),
     thumb:    a.images?.jpg?.large_image_url || a.images?.jpg?.image_url || '',
     synopsis: a.synopsis || 'Tidak ada sinopsis.',
     rating:   a.score ? String(a.score) : null,
     status:   a.status === 'Currently Airing' ? 'Ongoing' :
-              a.status === 'Finished Airing'   ? 'Complete' : (a.status || 'Unknown'),
+              a.status === 'Finished Airing'   ? 'Complete' : (a.status || ''),
     type:     a.type || 'TV',
-    episode:  a.episodes ? String(a.episodes) : (a.aired_on ? '?' : null),
+    episode:  a.episodes ? String(a.episodes) : '?',
     duration: a.duration || null,
     aired:    a.aired?.string || null,
     studio:   a.studios?.[0]?.name || null,
     genres:   a.genres?.map(g => g.name) || [],
-    day:      a.broadcast?.day?.replace(' JST','') || null,
-    episodes: [], // diisi saat scrape Samehadaku
+    day:      a.broadcast?.day?.replace(' JST', '') || null,
+    episodes: [],
   };
 }
-
-// ═══════════════════════════════════════════
-//   JIKAN SCRAPERS
-// ═══════════════════════════════════════════
 
 async function getOngoing(page = 1) {
   const k = `ongoing_${page}`;
   const cached = getCache(k);
-  if (cached) { console.log('Cache hit:', k); return cached; }
-
+  if (cached) return cached;
   const d = await jikan(`/seasons/now?filter=tv&limit=24&page=${page}`);
   const animes = (d.data || []).map(formatAnime).filter(Boolean);
   setCache(k, animes, TTL.ongoing);
@@ -160,23 +139,17 @@ async function getOngoing(page = 1) {
 async function getComplete(page = 1) {
   const k = `complete_${page}`;
   const cached = getCache(k);
-  if (cached) { console.log('Cache hit:', k); return cached; }
-
-  // Ambil dari season sebelumnya
-  const now  = new Date();
-  const yr   = now.getFullYear();
-  const mo   = now.getMonth(); // 0-11
+  if (cached) return cached;
+  const now = new Date();
+  const yr  = now.getFullYear();
+  const mo  = now.getMonth();
   const seasons = ['winter','spring','summer','fall'];
-  const curSeason = Math.floor(mo / 3);
-  const prevSeason = curSeason === 0
+  const cur  = Math.floor(mo / 3);
+  const prev = cur === 0
     ? { year: yr - 1, season: 'fall' }
-    : { year: yr, season: seasons[curSeason - 1] };
-
-  const d = await jikan(`/seasons/${prevSeason.year}/${prevSeason.season}?filter=tv&limit=24&page=${page}`);
-  const animes = (d.data || [])
-    .map(formatAnime)
-    .filter(Boolean)
-    .map(a => ({ ...a, status: 'Complete' }));
+    : { year: yr, season: seasons[cur - 1] };
+  const d = await jikan(`/seasons/${prev.year}/${prev.season}?filter=tv&limit=24&page=${page}`);
+  const animes = (d.data || []).map(formatAnime).filter(Boolean).map(a => ({ ...a, status: 'Complete' }));
   setCache(k, animes, TTL.complete);
   return animes;
 }
@@ -184,29 +157,30 @@ async function getComplete(page = 1) {
 async function getSchedule() {
   const k = 'schedule';
   const cached = getCache(k);
-  if (cached) { console.log('Cache hit: schedule'); return cached; }
-
-  const days = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
-  const dayId = ['Senin','Selasa','Rabu','Kamis','Jumat','Sabtu','Minggu'];
-  const schedules = [];
-
-  // Fetch semua hari secara paralel (hemat waktu)
+  if (cached) return cached;
+  const days   = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
+  const dayId  = ['Senin','Selasa','Rabu','Kamis','Jumat','Sabtu','Minggu'];
   const results = await Promise.allSettled(
     days.map(d => jikan(`/schedules?filter=${d}&limit=25`))
   );
-
+  const schedules = [];
   results.forEach((r, i) => {
     if (r.status === 'rejected') return;
-    const animeList = (r.value.data || []).map(a => ({
-      title: a.title || a.title_english || '',
-      slug:  titleToSlug(a.title || ''),
+    const list = (r.value.data || []).map(a => ({
       mal_id: a.mal_id,
-      thumb: a.images?.jpg?.image_url || '',
+      title:  a.title || '',
+      slug:   titleToSlug(a.title || ''),
+      thumb:  a.images?.jpg?.image_url || '',
       episode: a.episodes ? String(a.episodes) : '?',
     })).filter(a => a.title);
-    if (animeList.length) schedules.push({ day: dayId[i], animeList });
+    // Deduplicate
+    const seen = new Set();
+    const unique = list.filter(a => {
+      if (seen.has(a.mal_id)) return false;
+      seen.add(a.mal_id); return true;
+    });
+    if (unique.length) schedules.push({ day: dayId[i], animeList: unique });
   });
-
   setCache(k, schedules, TTL.schedule);
   return schedules;
 }
@@ -214,12 +188,11 @@ async function getSchedule() {
 async function searchAnime(query) {
   const k = `search_${query.toLowerCase().trim()}`;
   const cached = getCache(k);
-  if (cached) { console.log('Cache hit:', k); return cached; }
-
+  if (cached) return cached;
   const d = await jikan(`/anime?q=${encodeURIComponent(query)}&limit=10&type=tv`);
   const results = (d.data || []).map(a => ({
     mal_id: a.mal_id,
-    title:  a.title || a.title_english || '',
+    title:  a.title || '',
     slug:   titleToSlug(a.title || ''),
     thumb:  a.images?.jpg?.image_url || '',
     status: a.status === 'Currently Airing' ? 'Ongoing' : 'Complete',
@@ -233,28 +206,27 @@ async function searchAnime(query) {
 async function getAnimeDetail(slugOrId) {
   const k = `anime_${slugOrId}`;
   const cached = getCache(k);
-  if (cached) { console.log('Cache hit:', k); return cached; }
+  if (cached) return cached;
 
   let data;
-  // Kalau berupa angka/MAL ID langsung
   if (/^\d+$/.test(slugOrId)) {
     const d = await jikan(`/anime/${slugOrId}/full`);
     data = d.data;
   } else {
-    // Search berdasarkan slug → ambil hasil pertama
     const query = slugOrId.replace(/-sub-indo/gi, '').replace(/-/g, ' ');
     const d = await jikan(`/anime?q=${encodeURIComponent(query)}&limit=5`);
     data = d.data?.[0];
   }
-
   if (!data) return null;
+
   const anime = formatAnime(data);
 
-  // Ambil episode list dari Samehadaku (scrape ringan)
+  // Ambil episode list dari Sanka Vollerei
   try {
-    anime.episodes = await getSamehadakuEpisodes(anime.slug);
+    anime.episodes = await getSankaEpisodeList(anime.slug);
+    console.log(`[Sanka] Episodes for ${anime.slug}: ${anime.episodes.length}`);
   } catch(e) {
-    console.log('Episode scrape skip:', e.message);
+    console.log(`[Sanka] Episode list error: ${e.message}`);
     anime.episodes = [];
   }
 
@@ -262,196 +234,170 @@ async function getAnimeDetail(slugOrId) {
   return anime;
 }
 
-// ═══════════════════════════════════════════
-//   SAMEHADAKU SCRAPERS (hanya untuk episode/video)
-// ═══════════════════════════════════════════
+// ══════════════════════════════════════════════
+//   SANKA VOLLEREI — Episode & Video
+// ══════════════════════════════════════════════
 
-// Ambil daftar episode dari Samehadaku
-async function getSamehadakuEpisodes(slug) {
-  const k = `eplist_${slug}`;
+// Ambil daftar episode dari Sanka Vollerei
+async function getSankaEpisodeList(animeSlug) {
+  const k = `eplist_${animeSlug}`;
   const cached = getCache(k);
   if (cached) return cached;
 
-  // Samehadaku URL format: /anime/slug-sub-indo/
-  const slugFull = slug.endsWith('-sub-indo') ? slug : `${slug}-sub-indo`;
-  const html = await fetchSamehadaku(`/anime/${slugFull}/`);
-  const doc  = parse(html);
+  // Coba ambil via episode pertama → dapat recommendedEpisodeList
+  const epId = `${animeSlug}-episode-1`;
+  const d = await sanka(`/anime/samehadaku/episode/${epId}`);
 
-  const episodes = [];
+  if (d.status !== 'success' || !d.data) throw new Error('Sanka episode not found');
 
-  // Selector Samehadaku — daftar episode biasanya di .episodelist atau .eps-list
-  const epSelectors = [
-    '.episodelist li a',
-    '.episode-list li a',
-    '#episodelist li a',
-    '.eps li a',
-    '[class*="episode"] li a',
-    'ul.eps a',
-    '.episodes-list a',
-  ];
+  // Bangun list dari recommendedEpisodeList + current episode
+  const rawList = d.data.recommendedEpisodeList || [];
 
-  for (const sel of epSelectors) {
-    const links = doc.querySelectorAll(sel);
-    if (!links.length) continue;
-    links.forEach((a, i) => {
-      const href  = getHref(a);
-      const title = txt(a);
-      if (!href || !title) return;
-      const epSlug = href.replace(/.*\/episode\//, '').replace(/\/$/, '').trim();
-      if (!epSlug) return;
-      const num = title.match(/\d+(\.\d+)?/)?.[0] || String(i + 1);
-      episodes.push({ title, slug: epSlug, url: href, episode: num });
+  // Tambah episode 1 sendiri jika belum ada
+  const allEps = [];
+  const seen = new Set();
+
+  // Episode dari recommended list
+  rawList.forEach(ep => {
+    if (!ep.episodeId || seen.has(ep.episodeId)) return;
+    seen.add(ep.episodeId);
+    const num = ep.episodeId.match(/episode-(\d+[\w-]*)/)?.[1] || '?';
+    allEps.push({
+      title: ep.title || `Episode ${num}`,
+      episode: num,
+      slug: ep.episodeId,
     });
-    if (episodes.length) { console.log(`Episodes: ${episodes.length} via "${sel}"`); break; }
-  }
+  });
 
-  // Fallback: scan semua link /episode/
-  if (!episodes.length) {
-    doc.querySelectorAll('a[href*="/episode/"]').forEach((a, i) => {
-      const href  = getHref(a);
-      const title = txt(a);
-      if (!href || !title) return;
-      const epSlug = href.split('/episode/')[1]?.replace(/\/$/, '') || '';
-      if (!epSlug) return;
-      const num = title.match(/\d+/)?.[0] || String(i + 1);
-      episodes.push({ title, slug: epSlug, url: href, episode: num });
+  // Tambah ep 1 jika belum ada
+  if (!seen.has(epId)) {
+    allEps.push({
+      title: d.data.title || `Episode 1`,
+      episode: '1',
+      slug: epId,
     });
   }
 
-  // Urutkan dari episode 1
-  episodes.reverse();
-  setCache(k, episodes, TTL.episode);
-  return episodes;
+  // Sort berdasarkan nomor episode
+  allEps.sort((a, b) => {
+    const na = parseFloat(a.episode) || 0;
+    const nb = parseFloat(b.episode) || 0;
+    return na - nb;
+  });
+
+  setCache(k, allEps, TTL.eplist);
+  return allEps;
 }
 
-// Ambil server video dari episode Samehadaku
-async function getSamehadakuEpisodeVideo(epSlug) {
-  const k = `ep_${epSlug}`;
+// Ambil data video dari satu episode
+async function getSankaEpisode(episodeId) {
+  const k = `ep_${episodeId}`;
   const cached = getCache(k);
-  if (cached) { console.log('Cache hit:', k); return cached; }
+  if (cached) return cached;
 
-  const html = await fetchSamehadaku(`/episode/${epSlug}/`);
-  const doc  = parse(html);
+  const d = await sanka(`/anime/samehadaku/episode/${episodeId}`);
+  if (d.status !== 'success' || !d.data) throw new Error('Episode not found');
 
-  const servers = [];
+  const epData = d.data;
 
-  // Cari semua iframe embed
-  const iframes = doc.querySelectorAll('iframe');
-  iframes.forEach((iframe, i) => {
-    const src = getSrc(iframe) || attr(iframe, 'data-src');
-    if (src && src.startsWith('http')) {
-      servers.push({
-        name: `Server ${i + 1}`,
-        url:  src,
-        type: 'iframe',
+  // Susun daftar kualitas dari server.qualities
+  const qualities = [];
+  (epData.server?.qualities || []).forEach(q => {
+    if (!q.serverList?.length) return;
+    q.serverList.forEach(s => {
+      qualities.push({
+        quality: q.title,          // "360p", "480p", "720p", "1080p"
+        name:    s.title,          // "Premium 1080p", "Vidhide 720p"
+        serverId: s.serverId,      // "8DE8E-9-xhmyrq"
       });
-    }
-  });
-
-  // Cari server links (mirror)
-  const mirrorSels = [
-    '.mirror-list a', '[class*="mirror"] a',
-    '.server-list a', '.streaming a',
-    '[class*="server"] a', '[class*="stream"] a',
-  ];
-  for (const sel of mirrorSels) {
-    const links = doc.querySelectorAll(sel);
-    if (!links.length) continue;
-    links.forEach(a => {
-      const url  = getHref(a);
-      const name = txt(a) || 'Mirror';
-      if (url && url.startsWith('http') && !servers.find(s => s.url === url)) {
-        servers.push({ name, url, type: 'iframe' });
-      }
     });
-    if (servers.length) break;
-  }
-
-  // Cari embed dari JS inline (desu, nanistream, dll)
-  const scripts = doc.querySelectorAll('script');
-  scripts.forEach(s => {
-    const code = txt(s);
-    const matches = code.match(/(?:src|url|file)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/g);
-    if (matches) {
-      matches.forEach(m => {
-        const url = m.match(/["'](https?:\/\/[^"']+)["']/)?.[1];
-        if (url && !url.includes('.js') && !servers.find(x => x.url === url)) {
-          servers.push({ name: 'Stream', url, type: 'iframe' });
-        }
-      });
-    }
   });
 
-  const result = { servers, slug: epSlug };
+  const result = {
+    title:    epData.title,
+    animeId:  epData.animeId,
+    defaultUrl: epData.defaultStreamingUrl || null,
+    qualities,
+    // Navigasi
+    prevEp: epData.prevEpisode?.episodeId || null,
+    nextEp: epData.nextEpisode?.episodeId || null,
+    // Download bonus
+    downloads: buildDownloads(epData.downloadUrl),
+  };
+
   setCache(k, result, TTL.episode);
   return result;
 }
 
-// ═══════════════════════════════════════════
-//   ROUTES
-// ═══════════════════════════════════════════
+// Ambil embed/MP4 URL dari serverId
+async function getSankaServer(serverId) {
+  const k = `server_${serverId}`;
+  const cached = getCache(k);
+  if (cached) return cached;
 
-// Health + info
-app.get('/', (req, res) => {
-  res.json({
-    name: 'KitsuneID API',
-    version: '4.0.0',
-    status: 'running',
-    sources: { info: 'Jikan (MyAnimeList)', video: 'Samehadaku' },
-    cache: { size: cache.size, keys: [...cache.keys()].slice(0, 20) },
-    endpoints: ['/ongoing','/complete','/schedule','/search','/anime','/episode','/ping','/cache/clear']
+  const d = await sanka(`/anime/samehadaku/server/${serverId}`);
+  if (d.status !== 'success') throw new Error('Server error');
+
+  const url = d.data?.url || null;
+  if (url) setCache(k, { url }, TTL.server);
+  return { url };
+}
+
+// Helper: susun download links yang bersih
+function buildDownloads(downloadUrl) {
+  if (!downloadUrl?.formats) return [];
+  const result = [];
+  downloadUrl.formats.forEach(fmt => {
+    (fmt.qualities || []).forEach(q => {
+      (q.urls || []).slice(0, 3).forEach(u => { // max 3 host per kualitas
+        result.push({
+          quality: q.title.trim(),
+          host:    u.title,
+          url:     u.url,
+        });
+      });
+    });
   });
-});
+  return result;
+}
 
-// Keep-alive ping
-app.get('/ping', (req, res) => {
-  res.json({ pong: true, time: new Date().toISOString(), cache: cache.size });
-});
+// ══════════════════════════════════════════════
+//   ROUTES
+// ══════════════════════════════════════════════
 
-// Clear cache
+app.get('/', (req, res) => res.json({
+  name: 'KitsuneID API',
+  version: '5.0.0',
+  status: 'running 🦊',
+  sources: { info: 'Jikan (MAL)', video: 'Sanka Vollerei (Samehadaku)' },
+  cache: cache.size,
+  endpoints: ['/ongoing','/complete','/schedule','/search','/anime',
+              '/episode','/server','/ping','/cache/clear']
+}));
+
+app.get('/ping', (req, res) => res.json({ pong: true, time: new Date().toISOString() }));
+
 app.get('/cache/clear', (req, res) => {
-  const n = cache.size;
-  cache.clear();
+  const n = cache.size; cache.clear();
   res.json({ cleared: n });
-});
-
-// Debug — lihat HTML samehadaku (untuk troubleshoot)
-app.get('/debug', async (req, res) => {
-  const slug = req.query.slug || 'jujutsu-kaisen-season-3-sub-indo';
-  const type = req.query.type || 'anime'; // anime | episode
-  try {
-    const html = type === 'episode'
-      ? await fetchSamehadaku(`/episode/${slug}/`)
-      : await fetchSamehadaku(`/anime/${slug}/`);
-    const classes = [...new Set(html.match(/class="([^"]+)"/g) || [])].slice(0, 50);
-    res.json({ slug, type, length: html.length, preview: html.slice(0, 2000), classes });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
 });
 
 // Ongoing
 app.get('/ongoing', async (req, res) => {
-  try {
-    const animes = await getOngoing(parseInt(req.query.page) || 1);
-    res.json({ animes });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  try { res.json({ animes: await getOngoing(+req.query.page || 1) }); }
+  catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // Complete
 app.get('/complete', async (req, res) => {
-  try {
-    const animes = await getComplete(parseInt(req.query.page) || 1);
-    res.json({ animes });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  try { res.json({ animes: await getComplete(+req.query.page || 1) }); }
+  catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // Schedule
 app.get('/schedule', async (req, res) => {
-  try {
-    const schedules = await getSchedule();
-    res.json({ schedules });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  try { res.json({ schedules: await getSchedule() }); }
+  catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // Search
@@ -463,53 +409,58 @@ app.get('/search', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Anime detail (by slug atau MAL ID)
+// Anime detail
 app.get('/anime', async (req, res) => {
   try {
-    const slug = req.query.slug;
-    const id   = req.query.id;
-    if (!slug && !id) return res.status(400).json({ error: 'Parameter slug atau id diperlukan' });
-    const data = await getAnimeDetail(id || slug);
+    const id = req.query.id || req.query.slug;
+    if (!id) return res.status(400).json({ error: 'Parameter slug atau id diperlukan' });
+    const data = await getAnimeDetail(id);
     if (!data) return res.status(404).json({ error: 'Anime tidak ditemukan' });
     res.json(data);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Episode video (Samehadaku)
+// Episode — data video + kualitas
 app.get('/episode', async (req, res) => {
   try {
-    const slug = req.query.slug;
-    if (!slug) return res.status(400).json({ error: 'Parameter slug diperlukan' });
-    res.json(await getSamehadakuEpisodeVideo(slug));
+    const id = req.query.id || req.query.slug;
+    if (!id) return res.status(400).json({ error: 'Parameter id diperlukan' });
+    res.json(await getSankaEpisode(id));
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Server — dapat MP4 URL dari serverId
+app.get('/server', async (req, res) => {
+  try {
+    const id = req.query.id;
+    if (!id) return res.status(400).json({ error: 'Parameter id diperlukan' });
+    res.json(await getSankaServer(id));
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── START ─────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`🦊 KitsuneID API v4.0 running on port ${PORT}`);
-  console.log('   Sources: Jikan (info) + Samehadaku (video)');
+  console.log(`🦊 KitsuneID API v5.0 running on port ${PORT}`);
+  console.log('   Jikan (info) + Sanka Vollerei (video) — Zero ScraperAPI!');
 
-  // Keep-alive: ping diri sendiri setiap 4 menit
+  // Keep-alive
   const SELF = process.env.RAILWAY_PUBLIC_DOMAIN
     ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/ping`
     : `http://localhost:${PORT}/ping`;
-
   setInterval(() => {
-    const mod = SELF.startsWith('https') ? https : http;
-    mod.get(SELF, r => console.log(`[keep-alive] ${r.statusCode}`))
-       .on('error', e => console.log('[keep-alive] error:', e.message));
+    const mod = SELF.startsWith('https') ? https : require('http');
+    mod.get(SELF, r => console.log(`[ping] ${r.statusCode}`))
+       .on('error', e => console.log('[ping] err:', e.message));
   }, 4 * 60 * 1000);
 
-  // Warm-up: pre-load cache penting saat startup
+  // Warm-up cache
   setTimeout(async () => {
     try {
-      console.log('[warm-up] Loading ongoing...');
+      console.log('[warm-up] Ongoing...');
       await getOngoing(1);
-      console.log('[warm-up] Loading schedule...');
+      console.log('[warm-up] Schedule...');
       await getSchedule();
       console.log('[warm-up] ✅ Done!');
-    } catch(e) {
-      console.log('[warm-up] Error:', e.message);
-    }
+    } catch(e) { console.log('[warm-up] Error:', e.message); }
   }, 3000);
 });
