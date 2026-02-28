@@ -196,44 +196,56 @@ async function searchAnime(query) {
 }
 
 // ── Cari animeId Otakudesu dari judul/slug Jikan ─
-// Coba beberapa strategi pencarian, ambil hasil paling mirip
+// Semua query dijalankan PARALLEL → ambil hasil terbaik tercepat
+const resolveCache = new Map(); // cache slug hasil resolve
+
 async function resolveOtakudesuId(jikanSlug) {
-  // Strategi pencarian: dari yang paling spesifik ke paling umum
+  // Cek cache dulu — kalau sudah pernah resolve, langsung return
+  if (resolveCache.has(jikanSlug)) {
+    console.log(`[resolve] Cache hit: ${jikanSlug} → ${resolveCache.get(jikanSlug)}`);
+    return resolveCache.get(jikanSlug);
+  }
+
   const baseTitle = jikanSlug.replace(/-/g, ' ');
 
-  // Hilangkan kata umum untuk variasi query
   const shortTitle = baseTitle
     .replace(/\b(season|part|the|a|an|no|wa|ga|wo|ni|to)\b/gi, '')
     .replace(/\s+/g, ' ').trim();
 
-  // Hanya kata pertama (judul utama tanpa season)
   const mainTitle = baseTitle.split(/\s+(season|part|s\d|episode)\s*/i)[0].trim();
 
   const queries = [
-    baseTitle,                    // "sousou no frieren season 2"
-    shortTitle,                   // "sousou frieren 2"
-    mainTitle,                    // "sousou no frieren"
-    baseTitle.split(' ').slice(0, 4).join(' '), // 4 kata pertama
-  ].filter((q, i, arr) => q.length > 2 && arr.indexOf(q) === i); // deduplicate
+    baseTitle,
+    shortTitle,
+    mainTitle,
+    baseTitle.split(' ').slice(0, 3).join(' '),
+  ].filter((q, i, arr) => q.length > 2 && arr.indexOf(q) === i);
 
-  for (const query of queries) {
+  // Jalankan semua query secara PARALLEL
+  const searchPromises = queries.map(async (query) => {
     try {
-      console.log(`[resolve] Trying query: "${query}"`);
       const d = await fetchJSON(`${SANKA}/search/${encodeURIComponent(query)}`);
-      if (d.status !== 'success' || !d.data?.animeList?.length) continue;
-
-      const list = d.data.animeList;
-
-      // Cari yang paling mirip judulnya
-      const best = findBestMatch(baseTitle, list);
-      if (best) {
-        console.log(`[resolve] Found: "${best.title}" → ${best.animeId}`);
-        return best.animeId;
-      }
+      if (d.status !== 'success' || !d.data?.animeList?.length) return null;
+      const best = findBestMatch(baseTitle, d.data.animeList);
+      return best ? { animeId: best.animeId, title: best.title, score: best._score } : null;
     } catch(e) {
-      console.log(`[resolve] Query "${query}" failed: ${e.message}`);
+      return null;
     }
+  });
+
+  // Tunggu semua selesai, ambil yang score tertinggi
+  const results = await Promise.all(searchPromises);
+  const best = results
+    .filter(Boolean)
+    .sort((a, b) => (b.score || 0) - (a.score || 0))[0];
+
+  if (best) {
+    console.log(`[resolve] ${jikanSlug} → ${best.animeId} (score: ${best.score})`);
+    resolveCache.set(jikanSlug, best.animeId); // simpan ke cache
+    return best.animeId;
   }
+
+  resolveCache.set(jikanSlug, null); // cache miss juga biar tidak retry terus
   return null;
 }
 
