@@ -288,8 +288,7 @@ function findBestMatch(targetTitle, animeList) {
   return scored[0]?._score >= 20 ? scored[0] : null;
 }
 
-// ── Resolve Otakudesu ID dan simpan mapping ──
-// Juga simpan info Sanka detail di cache setelah resolve
+// ── Resolve + fetch Sanka dengan timeout ────
 async function resolveAndFetchSanka(animeId) {
   let resolvedId = animeId;
   if (!animeId.includes('-sub-indo') && !animeId.match(/^\d+$/)) {
@@ -311,89 +310,85 @@ function parseSankaEpisodes(raw) {
   })).sort((a, b) => parseFloat(a.episode) - parseFloat(b.episode));
 }
 
-// TAHAP 1: Info anime dari Jikan — CEPAT, tidak tunggu Sanka
-async function getAnimeInfo(slugOrId) {
-  const k = `info_${slugOrId}`;
+// Ambil info dari Jikan (cepat) + episode dari Sanka (dengan timeout 6 detik)
+async function getAnimeDetail(animeId) {
+  const k = `anime_${animeId}`;
   const cached = getCache(k);
   if (cached) return cached;
 
-  let data;
-  if (/^\d+$/.test(slugOrId)) {
-    const d = await jikan(`/anime/${slugOrId}/full`);
-    data = d.data;
-  } else {
-    const query = slugOrId.replace(/-/g, ' ');
-    const d = await jikan(`/anime?q=${encodeURIComponent(query)}&limit=5`);
-    data = d.data?.[0];
-  }
-  if (!data) return null;
-
-  const info = {
-    mal_id:   data.mal_id,
-    title:    data.title || slugOrId,
-    titleEn:  data.title_english || '',
-    slug:     slugOrId,
-    thumb:    data.images?.jpg?.large_image_url || data.images?.jpg?.image_url || '',
-    synopsis: data.synopsis || 'Tidak ada sinopsis.',
-    rating:   data.score ? String(data.score) : null,
-    status:   data.status === 'Currently Airing' ? 'Ongoing' :
-              data.status === 'Finished Airing'   ? 'Complete' : (data.status || ''),
-    type:     data.type || 'TV',
-    episode:  data.episodes ? String(data.episodes) : '?',
-    duration: data.duration || null,
-    aired:    data.aired?.string || null,
-    studio:   data.studios?.[0]?.name || null,
-    genres:   data.genres?.map(g => g.name) || [],
-    episodes: [], // kosong dulu, diisi oleh /anime/episodes
-    _episodesReady: false,
-  };
-
-  setCache(k, info, TTL.anime);
-
-  // Kick off Sanka resolve di background (tidak ditunggu)
-  // Hasilnya akan di-cache dan siap saat /anime/episodes dipanggil
-  resolveAndFetchSanka(slugOrId).then(result => {
-    if (!result) return;
-    const epList = parseSankaEpisodes(result.raw);
-    // Simpan episode list ke cache terpisah
-    setCache(`episodes_${slugOrId}`, {
-      episodes: epList,
-      otakudesuSlug: result.resolvedId,
-    }, TTL.anime);
-    // Update info cache juga
-    const infoCache = getCache(k);
-    if (infoCache) {
-      infoCache.episodes = epList;
-      infoCache._episodesReady = true;
-      setCache(k, infoCache, TTL.anime);
+  // Jalan parallel: Jikan (info) + Sanka (episodes) bersamaan
+  const jikanPromise = (async () => {
+    if (/^\d+$/.test(animeId)) {
+      const d = await jikan(`/anime/${animeId}/full`);
+      return d.data;
+    } else {
+      const query = animeId.replace(/-/g, ' ');
+      const d = await jikan(`/anime?q=${encodeURIComponent(query)}&limit=5`);
+      return d.data?.[0];
     }
-    console.log(`[bg] Episodes ready for ${slugOrId}: ${epList.length} eps`);
-  }).catch(e => {
-    console.log(`[bg] Sanka resolve failed for ${slugOrId}: ${e.message}`);
+  })();
+
+  // Sanka dengan timeout 6 detik
+  const sankaPromise = new Promise(async (resolve) => {
+    const timer = setTimeout(() => {
+      console.log(`[sanka] Timeout for ${animeId}`);
+      resolve(null);
+    }, 6000);
+    try {
+      const result = await resolveAndFetchSanka(animeId);
+      clearTimeout(timer);
+      resolve(result);
+    } catch(e) {
+      clearTimeout(timer);
+      resolve(null);
+    }
   });
 
-  return info;
-}
+  // Tunggu keduanya (Jikan biasanya selesai duluan)
+  const [jikanData, sankaResult] = await Promise.all([jikanPromise, sankaPromise]);
+  if (!jikanData) return null;
 
-// TAHAP 2: Episode list dari Sanka — bisa lambat, dipanggil terpisah
-async function getAnimeEpisodes(slugOrId) {
-  // Cek cache episode dulu
-  const epCache = getCache(`episodes_${slugOrId}`);
-  if (epCache) return epCache;
+  // Parse episodes dari Sanka (kalau ada)
+  const episodes = sankaResult ? parseSankaEpisodes(sankaResult.raw) : [];
+  const otakudesuSlug = sankaResult?.resolvedId || null;
 
-  // Belum ada di cache, fetch sekarang
-  const result = await resolveAndFetchSanka(slugOrId);
-  if (!result) throw new Error('Anime tidak ditemukan di Otakudesu');
+  // Synopsis dari Sanka (bahasa Indo) lebih baik, fallback ke Jikan
+  let synopsis = jikanData.synopsis || 'Tidak ada sinopsis.';
+  if (sankaResult?.raw) {
+    const raw = sankaResult.raw;
+    if (typeof raw.synopsis === 'string' && raw.synopsis) {
+      synopsis = raw.synopsis;
+    } else if (Array.isArray(raw.synopsis?.paragraphs) && raw.synopsis.paragraphs.length) {
+      synopsis = raw.synopsis.paragraphs.join(' ');
+    } else if (raw.sinopsis) {
+      synopsis = raw.sinopsis;
+    }
+  }
 
-  const episodes = parseSankaEpisodes(result.raw);
-  const data = { episodes, otakudesuSlug: result.resolvedId };
-  setCache(`episodes_${slugOrId}`, data, TTL.anime);
-  return data;
-}
+  const anime = {
+    mal_id:   jikanData.mal_id,
+    title:    jikanData.title || animeId,
+    titleEn:  jikanData.title_english || '',
+    slug:     otakudesuSlug || animeId,
+    thumb:    jikanData.images?.jpg?.large_image_url || jikanData.images?.jpg?.image_url || '',
+    synopsis,
+    rating:   jikanData.score ? String(jikanData.score) : null,
+    status:   jikanData.status === 'Currently Airing' ? 'Ongoing' :
+              jikanData.status === 'Finished Airing'   ? 'Complete' : (jikanData.status || ''),
+    type:     jikanData.type || 'TV',
+    episode:  jikanData.episodes ? String(jikanData.episodes) : String(episodes.length || '?'),
+    duration: jikanData.duration || sankaResult?.raw?.duration || null,
+    aired:    jikanData.aired?.string || sankaResult?.raw?.aired || null,
+    studio:   jikanData.studios?.[0]?.name || sankaResult?.raw?.studios || null,
+    genres:   jikanData.genres?.map(g => g.name) || [],
+    episodes,
+    _episodesReady: episodes.length > 0,
+    _source:  episodes.length > 0 ? 'jikan+otakudesu' : 'jikan',
+  };
 
-// Backward compat: getAnimeDetail masih ada tapi pakai getAnimeInfo
-async function getAnimeDetail(animeId) {
-  return getAnimeInfo(animeId);
+  // Cache lebih lama kalau episodes sudah ada
+  setCache(k, anime, episodes.length > 0 ? TTL.anime : 5 * 60 * 1000);
+  return anime;
 }
 
 // Episode video dari Sanka (Otakudesu)
@@ -509,18 +504,8 @@ app.get('/anime', async (req, res) => {
   try {
     const slug = req.query.slug || req.query.id;
     if (!slug) return res.status(400).json({ error: 'Parameter slug diperlukan' });
-    const info = await getAnimeInfo(slug);
-    if (!info) return res.status(404).json({ error: 'Anime tidak ditemukan' });
-    res.json(info);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// Tahap 2: Episode list dari Sanka — dipanggil terpisah oleh frontend
-app.get('/anime/episodes', async (req, res) => {
-  try {
-    const slug = req.query.slug || req.query.id;
-    if (!slug) return res.status(400).json({ error: 'Parameter slug diperlukan' });
-    const data = await getAnimeEpisodes(slug);
+    const data = await getAnimeDetail(slug);
+    if (!data) return res.status(404).json({ error: 'Anime tidak ditemukan' });
     res.json(data);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
