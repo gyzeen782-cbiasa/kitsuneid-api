@@ -195,28 +195,103 @@ async function searchAnime(query) {
   return results;
 }
 
+// ── Cari animeId Otakudesu dari judul/slug Jikan ─
+// Coba beberapa strategi pencarian, ambil hasil paling mirip
+async function resolveOtakudesuId(jikanSlug) {
+  // Strategi pencarian: dari yang paling spesifik ke paling umum
+  const baseTitle = jikanSlug.replace(/-/g, ' ');
+
+  // Hilangkan kata umum untuk variasi query
+  const shortTitle = baseTitle
+    .replace(/\b(season|part|the|a|an|no|wa|ga|wo|ni|to)\b/gi, '')
+    .replace(/\s+/g, ' ').trim();
+
+  // Hanya kata pertama (judul utama tanpa season)
+  const mainTitle = baseTitle.split(/\s+(season|part|s\d|episode)\s*/i)[0].trim();
+
+  const queries = [
+    baseTitle,                    // "sousou no frieren season 2"
+    shortTitle,                   // "sousou frieren 2"
+    mainTitle,                    // "sousou no frieren"
+    baseTitle.split(' ').slice(0, 4).join(' '), // 4 kata pertama
+  ].filter((q, i, arr) => q.length > 2 && arr.indexOf(q) === i); // deduplicate
+
+  for (const query of queries) {
+    try {
+      console.log(`[resolve] Trying query: "${query}"`);
+      const d = await fetchJSON(`${SANKA}/search/${encodeURIComponent(query)}`);
+      if (d.status !== 'success' || !d.data?.animeList?.length) continue;
+
+      const list = d.data.animeList;
+
+      // Cari yang paling mirip judulnya
+      const best = findBestMatch(baseTitle, list);
+      if (best) {
+        console.log(`[resolve] Found: "${best.title}" → ${best.animeId}`);
+        return best.animeId;
+      }
+    } catch(e) {
+      console.log(`[resolve] Query "${query}" failed: ${e.message}`);
+    }
+  }
+  return null;
+}
+
+// Fuzzy match: cari anime dengan judul paling mirip
+function findBestMatch(targetTitle, animeList) {
+  const target = targetTitle.toLowerCase();
+
+  // Score tiap hasil
+  const scored = animeList.map(a => {
+    const t = (a.title || '').toLowerCase()
+      .replace(/\s+subtitle\s+indonesia/i, '')
+      .replace(/\(episode.*?\)/i, '')
+      .trim();
+
+    let score = 0;
+
+    // Exact match setelah normalisasi
+    if (t === target) score += 100;
+
+    // Semua kata target ada di judul
+    const targetWords = target.split(/\s+/).filter(w => w.length > 2);
+    const matchedWords = targetWords.filter(w => t.includes(w));
+    score += (matchedWords.length / targetWords.length) * 50;
+
+    // Panjang judul mirip (tidak terlalu jauh)
+    const lenDiff = Math.abs(t.length - target.length);
+    score -= lenDiff * 0.5;
+
+    // Bonus jika mengandung kata kunci season/part yang sama
+    const seasonTarget = target.match(/season\s*(\d+)|part\s*(\d+)|s(\d+)/i)?.[0] || '';
+    const seasonA      = t.match(/season\s*(\d+)|part\s*(\d+)|s(\d+)/i)?.[0] || '';
+    if (seasonTarget && seasonA && seasonTarget === seasonA) score += 30;
+    if (seasonTarget && !seasonA) score -= 20; // target punya season, hasil tidak
+
+    return { ...a, _score: score };
+  });
+
+  // Ambil yang score tertinggi, minimal score 20
+  scored.sort((a, b) => b._score - a._score);
+  return scored[0]?._score >= 20 ? scored[0] : null;
+}
+
 // Anime detail via Sanka (Otakudesu)
 async function getAnimeDetail(animeId) {
   const k = `anime_${animeId}`;
   const cached = getCache(k);
   if (cached) return cached;
 
-  // Kalau dari Jikan (slug biasa), cari dulu di Sanka
-  // Kalau dari Sanka search (animeId otakudesu), langsung ambil detail
   let resolvedId = animeId;
 
-  // Cek apakah ini Jikan slug (tidak ada -sub-indo) → perlu search Sanka dulu
+  // Kalau bukan Otakudesu ID (tidak ada -sub-indo) → resolve dulu
   if (!animeId.includes('-sub-indo') && !animeId.match(/^\d+$/)) {
-    console.log(`[anime] ${animeId} looks like Jikan slug, searching Sanka...`);
-    const query = animeId.replace(/-/g, ' ');
-    try {
-      const searchD = await fetchJSON(`${SANKA}/search/${encodeURIComponent(query)}`);
-      if (searchD.status === 'success' && searchD.data?.animeList?.length) {
-        resolvedId = searchD.data.animeList[0].animeId;
-        console.log(`[anime] Resolved ${animeId} → ${resolvedId}`);
-      }
-    } catch(e) {
-      console.log(`[anime] Search failed, using animeId as-is: ${e.message}`);
+    const found = await resolveOtakudesuId(animeId);
+    if (found) {
+      resolvedId = found;
+    } else {
+      console.log(`[anime] Could not resolve "${animeId}" to Otakudesu ID`);
+      throw new Error('Anime tidak ditemukan di Otakudesu');
     }
   }
 
