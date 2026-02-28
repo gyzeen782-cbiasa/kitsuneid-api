@@ -1,6 +1,5 @@
-// ===== server.js — KitsuneID API v5 =====
-// Arsitektur: Jikan API (info) + Sanka Vollerei (episode/video)
-// Zero ScraperAPI — semua gratis!
+// ===== server.js — KitsuneID API v5.1 =====
+// Arsitektur: Jikan (info) + SIPUTZX (episode list) + Sanka Vollerei (video)
 const express = require('express');
 const cors    = require('cors');
 const https   = require('https');
@@ -9,8 +8,9 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 
 // ── Sumber data ───────────────────────────────
-const JIKAN = 'https://api.jikan.moe/v4';
-const SANKA = 'https://www.sankavollerei.com';
+const JIKAN   = 'https://api.jikan.moe/v4';
+const SIPUTZX = 'https://app.siputzx.my.id/api/anime';
+const SANKA   = 'https://www.sankavollerei.com';
 
 app.use(cors());
 app.use(express.json());
@@ -26,6 +26,7 @@ const TTL = {
   eplist:   30 * 60 * 1000,
   episode:  30 * 60 * 1000,
   server:   60 * 60 * 1000,
+  slugmap:  60 * 60 * 1000,
 };
 function getCache(k) {
   const it = cache.get(k);
@@ -40,20 +41,13 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 // ── HTTP helpers ──────────────────────────────
-
-// Fetch JSON dari URL manapun
 function fetchJSON(url, headers = {}) {
   return new Promise((resolve, reject) => {
     const mod = url.startsWith('https') ? https : require('http');
     const req = mod.get(url, {
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'KitsuneID/5.0',
-        ...headers
-      },
+      headers: { 'Accept': 'application/json', 'User-Agent': 'KitsuneID/5.1', ...headers },
       timeout: 15000
     }, res => {
-      // Ikuti redirect
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return fetchJSON(res.headers.location, headers).then(resolve).catch(reject);
       }
@@ -61,16 +55,16 @@ function fetchJSON(url, headers = {}) {
       res.on('data', c => chunks.push(c));
       res.on('end', () => {
         try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
-        catch(e) { reject(new Error('JSON parse error: ' + e.message)); }
+        catch(e) { reject(new Error('JSON parse: ' + e.message)); }
       });
       res.on('error', reject);
     });
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Request timeout')); });
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
   });
 }
 
-// ── Jikan rate limiter (max 3 req/detik) ─────
+// Jikan rate limiter (max 3 req/detik)
 let jikanQueue = [], jikanBusy = false;
 function jikan(path) {
   return new Promise((res, rej) => {
@@ -86,14 +80,58 @@ async function processJikanQueue() {
   setTimeout(processJikanQueue, 340);
 }
 
-// ── Sanka Vollerei fetch ──────────────────────
-function sanka(path) {
-  return fetchJSON(`${SANKA}${path}`);
+// ══════════════════════════════════════════════
+//   SLUG MAPPING: Jikan title → Samehadaku slug
+// ══════════════════════════════════════════════
+// Mapping {normalizedTitle → samehadakuSlug}
+// Dibangun dari SIPUTZX release schedule (sudah terbukti akurat)
+
+let slugMap = {}; // { "jujutsu kaisen season 3": "jujutsu-kaisen-season-3", ... }
+
+async function buildSlugMap() {
+  const cached = getCache('slugmap');
+  if (cached) { slugMap = cached; return; }
+  try {
+    const d = await fetchJSON(`${SIPUTZX}/samehadaku/release`);
+    if (!d.status || !d.data) return;
+    const newMap = {};
+    Object.values(d.data).forEach(dayList => {
+      (dayList || []).forEach(anime => {
+        if (!anime.title || !anime.slug) return;
+        // key: normalize judul (lowercase, tanpa tanda baca)
+        const key = normalizeTitle(anime.title);
+        newMap[key] = anime.slug;
+        // Juga simpan dengan variasi umum (tanpa "sub indo")
+        newMap[normalizeTitle(anime.title.replace(/\s+sub\s+indo/gi, ''))] = anime.slug;
+      });
+    });
+    slugMap = newMap;
+    setCache('slugmap', newMap, TTL.slugmap);
+    console.log(`[slugmap] Built with ${Object.keys(newMap).length} entries`);
+  } catch(e) {
+    console.log('[slugmap] Error:', e.message);
+  }
 }
 
-// ══════════════════════════════════════════════
-//   JIKAN — Info anime
-// ══════════════════════════════════════════════
+function normalizeTitle(title) {
+  return (title || '').toLowerCase()
+    .replace(/[^\w\s]/g, '') // hapus tanda baca
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Cari slug Samehadaku yang tepat untuk anime dari Jikan
+function findSamehadakuSlug(jikanTitle) {
+  const key = normalizeTitle(jikanTitle);
+  if (slugMap[key]) return slugMap[key];
+
+  // Fallback: generate slug manual dari judul
+  return jikanTitle.toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .trim();
+}
 
 function titleToSlug(title) {
   return (title || '').toLowerCase()
@@ -103,13 +141,18 @@ function titleToSlug(title) {
     .trim();
 }
 
+// ══════════════════════════════════════════════
+//   JIKAN — Info anime
+// ══════════════════════════════════════════════
+
 function formatAnime(a) {
   if (!a) return null;
+  const jikanTitle = a.title || a.title_english || 'Unknown';
   return {
     mal_id:   a.mal_id,
-    title:    a.title || a.title_english || 'Unknown',
+    title:    jikanTitle,
     titleEn:  a.title_english || '',
-    slug:     titleToSlug(a.title || ''),
+    slug:     findSamehadakuSlug(jikanTitle), // pakai slug mapping!
     thumb:    a.images?.jpg?.large_image_url || a.images?.jpg?.image_url || '',
     synopsis: a.synopsis || 'Tidak ada sinopsis.',
     rating:   a.score ? String(a.score) : null,
@@ -121,7 +164,6 @@ function formatAnime(a) {
     aired:    a.aired?.string || null,
     studio:   a.studios?.[0]?.name || null,
     genres:   a.genres?.map(g => g.name) || [],
-    day:      a.broadcast?.day?.replace(' JST', '') || null,
     episodes: [],
   };
 }
@@ -158,28 +200,25 @@ async function getSchedule() {
   const k = 'schedule';
   const cached = getCache(k);
   if (cached) return cached;
-  const days   = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
-  const dayId  = ['Senin','Selasa','Rabu','Kamis','Jumat','Sabtu','Minggu'];
+  const days  = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
+  const dayId = ['Senin','Selasa','Rabu','Kamis','Jumat','Sabtu','Minggu'];
   const results = await Promise.allSettled(
     days.map(d => jikan(`/schedules?filter=${d}&limit=25`))
   );
   const schedules = [];
   results.forEach((r, i) => {
     if (r.status === 'rejected') return;
-    const list = (r.value.data || []).map(a => ({
-      mal_id: a.mal_id,
-      title:  a.title || '',
-      slug:   titleToSlug(a.title || ''),
-      thumb:  a.images?.jpg?.image_url || '',
-      episode: a.episodes ? String(a.episodes) : '?',
-    })).filter(a => a.title);
-    // Deduplicate
     const seen = new Set();
-    const unique = list.filter(a => {
-      if (seen.has(a.mal_id)) return false;
-      seen.add(a.mal_id); return true;
-    });
-    if (unique.length) schedules.push({ day: dayId[i], animeList: unique });
+    const list = (r.value.data || [])
+      .filter(a => a.title && !seen.has(a.mal_id) && seen.add(a.mal_id))
+      .map(a => ({
+        mal_id:  a.mal_id,
+        title:   a.title,
+        slug:    findSamehadakuSlug(a.title),
+        thumb:   a.images?.jpg?.image_url || '',
+        episode: a.episodes ? String(a.episodes) : '?',
+      }));
+    if (list.length) schedules.push({ day: dayId[i], animeList: list });
   });
   setCache(k, schedules, TTL.schedule);
   return schedules;
@@ -191,13 +230,13 @@ async function searchAnime(query) {
   if (cached) return cached;
   const d = await jikan(`/anime?q=${encodeURIComponent(query)}&limit=10&type=tv`);
   const results = (d.data || []).map(a => ({
-    mal_id: a.mal_id,
-    title:  a.title || '',
-    slug:   titleToSlug(a.title || ''),
-    thumb:  a.images?.jpg?.image_url || '',
-    status: a.status === 'Currently Airing' ? 'Ongoing' : 'Complete',
-    type:   a.type || 'TV',
-    rating: a.score ? String(a.score) : null,
+    mal_id:  a.mal_id,
+    title:   a.title || '',
+    slug:    findSamehadakuSlug(a.title || ''),
+    thumb:   a.images?.jpg?.image_url || '',
+    status:  a.status === 'Currently Airing' ? 'Ongoing' : 'Complete',
+    type:    a.type || 'TV',
+    rating:  a.score ? String(a.score) : null,
   }));
   setCache(k, results, TTL.search);
   return results;
@@ -213,20 +252,21 @@ async function getAnimeDetail(slugOrId) {
     const d = await jikan(`/anime/${slugOrId}/full`);
     data = d.data;
   } else {
-    const query = slugOrId.replace(/-sub-indo/gi, '').replace(/-/g, ' ');
+    const query = slugOrId.replace(/-/g, ' ');
     const d = await jikan(`/anime?q=${encodeURIComponent(query)}&limit=5`);
     data = d.data?.[0];
   }
   if (!data) return null;
 
   const anime = formatAnime(data);
+  // anime.slug sekarang sudah pakai slug Samehadaku yang benar!
 
-  // Ambil episode list dari Sanka Vollerei
+  // Ambil episode list dari SIPUTZX (lebih reliable, full list)
   try {
-    anime.episodes = await getSankaEpisodeList(anime.slug);
-    console.log(`[Sanka] Episodes for ${anime.slug}: ${anime.episodes.length}`);
+    anime.episodes = await getEpisodeListSiputzx(anime.slug);
+    console.log(`[SIPUTZX] Episodes for ${anime.slug}: ${anime.episodes.length}`);
   } catch(e) {
-    console.log(`[Sanka] Episode list error: ${e.message}`);
+    console.log(`[SIPUTZX] Episode list error for ${anime.slug}: ${e.message}`);
     anime.episodes = [];
   }
 
@@ -235,107 +275,87 @@ async function getAnimeDetail(slugOrId) {
 }
 
 // ══════════════════════════════════════════════
-//   SANKA VOLLEREI — Episode & Video
+//   SIPUTZX — Episode list (full, akurat)
 // ══════════════════════════════════════════════
 
-// Ambil daftar episode dari Sanka Vollerei
-async function getSankaEpisodeList(animeSlug) {
-  const k = `eplist_${animeSlug}`;
+async function getEpisodeListSiputzx(samehadakuSlug) {
+  const k = `eplist_${samehadakuSlug}`;
   const cached = getCache(k);
   if (cached) return cached;
 
-  // Coba ambil via episode pertama → dapat recommendedEpisodeList
-  const epId = `${animeSlug}-episode-1`;
-  const d = await sanka(`/anime/samehadaku/episode/${epId}`);
+  const url = `https://v1.samehadaku.how/anime/${samehadakuSlug}/`;
+  const d   = await fetchJSON(
+    `${SIPUTZX}/samehadaku/detail?link=${encodeURIComponent(url)}`
+  );
 
-  if (d.status !== 'success' || !d.data) throw new Error('Sanka episode not found');
-
-  // Bangun list dari recommendedEpisodeList + current episode
-  const rawList = d.data.recommendedEpisodeList || [];
-
-  // Tambah episode 1 sendiri jika belum ada
-  const allEps = [];
-  const seen = new Set();
-
-  // Episode dari recommended list
-  rawList.forEach(ep => {
-    if (!ep.episodeId || seen.has(ep.episodeId)) return;
-    seen.add(ep.episodeId);
-    const num = ep.episodeId.match(/episode-(\d+[\w-]*)/)?.[1] || '?';
-    allEps.push({
-      title: ep.title || `Episode ${num}`,
-      episode: num,
-      slug: ep.episodeId,
-    });
-  });
-
-  // Tambah ep 1 jika belum ada
-  if (!seen.has(epId)) {
-    allEps.push({
-      title: d.data.title || `Episode 1`,
-      episode: '1',
-      slug: epId,
-    });
+  if (!d.status || !d.data?.episodes?.length) {
+    throw new Error(`No episodes found for slug: ${samehadakuSlug}`);
   }
 
-  // Sort berdasarkan nomor episode
-  allEps.sort((a, b) => {
-    const na = parseFloat(a.episode) || 0;
-    const nb = parseFloat(b.episode) || 0;
-    return na - nb;
-  });
+  // SIPUTZX episode format: { title, date, link }
+  // link: "https://v1.samehadaku.how/EPISODE-SLUG/"
+  // Kita extract episodeId dari link untuk Sanka
+  const episodes = d.data.episodes.map(ep => {
+    const epSlug = ep.link.replace(/^https?:\/\/[^/]+\//, '').replace(/\/$/, '');
+    // Nomor episode dari title: "Blue Lock Season 2 Episode 1" → "1"
+    const num = ep.title?.match(/episode\s+(\d+[\w.-]*)/i)?.[1] ||
+                epSlug.match(/episode-(\d+[\w-]*)/)?.[1] || '?';
+    return {
+      title:   ep.title || `Episode ${num}`,
+      episode: num,
+      slug:    epSlug,          // format: "anime-title-episode-1"
+      date:    ep.date || '',
+    };
+  }).reverse(); // SIPUTZX urutkan dari terbaru, reverse ke EP1 dulu
 
-  setCache(k, allEps, TTL.eplist);
-  return allEps;
+  setCache(k, episodes, TTL.eplist);
+  return episodes;
 }
 
-// Ambil data video dari satu episode
+// ══════════════════════════════════════════════
+//   SANKA VOLLEREI — Video player
+// ══════════════════════════════════════════════
+
 async function getSankaEpisode(episodeId) {
   const k = `ep_${episodeId}`;
   const cached = getCache(k);
   if (cached) return cached;
 
-  const d = await sanka(`/anime/samehadaku/episode/${episodeId}`);
+  const d = await fetchJSON(`${SANKA}/anime/samehadaku/episode/${episodeId}`);
   if (d.status !== 'success' || !d.data) throw new Error('Episode not found');
 
-  const epData = d.data;
-
-  // Susun daftar kualitas dari server.qualities
   const qualities = [];
-  (epData.server?.qualities || []).forEach(q => {
+  (d.data.server?.qualities || []).forEach(q => {
     if (!q.serverList?.length) return;
     q.serverList.forEach(s => {
       qualities.push({
-        quality: q.title,          // "360p", "480p", "720p", "1080p"
-        name:    s.title,          // "Premium 1080p", "Vidhide 720p"
-        serverId: s.serverId,      // "8DE8E-9-xhmyrq"
+        quality:  q.title,
+        name:     s.title,
+        serverId: s.serverId,
       });
     });
   });
 
   const result = {
-    title:    epData.title,
-    animeId:  epData.animeId,
-    defaultUrl: epData.defaultStreamingUrl || null,
+    title:      d.data.title,
+    animeId:    d.data.animeId,
+    defaultUrl: d.data.defaultStreamingUrl || null,
     qualities,
-    // Navigasi
-    prevEp: epData.prevEpisode?.episodeId || null,
-    nextEp: epData.nextEpisode?.episodeId || null,
-    // Download bonus
-    downloads: buildDownloads(epData.downloadUrl),
+    prevEp:     d.data.prevEpisode?.episodeId || null,
+    nextEp:     d.data.nextEpisode?.episodeId || null,
+    downloads:  buildDownloads(d.data.downloadUrl),
   };
 
   setCache(k, result, TTL.episode);
   return result;
 }
 
-// Ambil embed/MP4 URL dari serverId
 async function getSankaServer(serverId) {
   const k = `server_${serverId}`;
   const cached = getCache(k);
   if (cached) return cached;
 
-  const d = await sanka(`/anime/samehadaku/server/${serverId}`);
+  const d = await fetchJSON(`${SANKA}/anime/samehadaku/server/${serverId}`);
   if (d.status !== 'success') throw new Error('Server error');
 
   const url = d.data?.url || null;
@@ -343,18 +363,13 @@ async function getSankaServer(serverId) {
   return { url };
 }
 
-// Helper: susun download links yang bersih
 function buildDownloads(downloadUrl) {
   if (!downloadUrl?.formats) return [];
   const result = [];
   downloadUrl.formats.forEach(fmt => {
     (fmt.qualities || []).forEach(q => {
-      (q.urls || []).slice(0, 3).forEach(u => { // max 3 host per kualitas
-        result.push({
-          quality: q.title.trim(),
-          host:    u.title,
-          url:     u.url,
-        });
+      (q.urls || []).slice(0, 3).forEach(u => {
+        result.push({ quality: q.title.trim(), host: u.title, url: u.url });
       });
     });
   });
@@ -366,41 +381,30 @@ function buildDownloads(downloadUrl) {
 // ══════════════════════════════════════════════
 
 app.get('/', (req, res) => res.json({
-  name: 'KitsuneID API',
-  version: '5.0.0',
-  status: 'running 🦊',
-  sources: { info: 'Jikan (MAL)', video: 'Sanka Vollerei (Samehadaku)' },
+  name: 'KitsuneID API', version: '5.1.0', status: 'running 🦊',
+  sources: { info: 'Jikan', episodes: 'SIPUTZX', video: 'Sanka Vollerei' },
+  slugMapSize: Object.keys(slugMap).length,
   cache: cache.size,
-  endpoints: ['/ongoing','/complete','/schedule','/search','/anime',
-              '/episode','/server','/ping','/cache/clear']
 }));
 
-app.get('/ping', (req, res) => res.json({ pong: true, time: new Date().toISOString() }));
+app.get('/ping',        (req, res) => res.json({ pong: true, time: new Date().toISOString() }));
+app.get('/cache/clear', (req, res) => { const n = cache.size; cache.clear(); res.json({ cleared: n }); });
 
-app.get('/cache/clear', (req, res) => {
-  const n = cache.size; cache.clear();
-  res.json({ cleared: n });
-});
-
-// Ongoing
 app.get('/ongoing', async (req, res) => {
   try { res.json({ animes: await getOngoing(+req.query.page || 1) }); }
   catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Complete
 app.get('/complete', async (req, res) => {
   try { res.json({ animes: await getComplete(+req.query.page || 1) }); }
   catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Schedule
 app.get('/schedule', async (req, res) => {
   try { res.json({ schedules: await getSchedule() }); }
   catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Search
 app.get('/search', async (req, res) => {
   try {
     const q = req.query.q;
@@ -409,7 +413,6 @@ app.get('/search', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Anime detail
 app.get('/anime', async (req, res) => {
   try {
     const id = req.query.id || req.query.slug;
@@ -420,7 +423,6 @@ app.get('/anime', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Episode — data video + kualitas
 app.get('/episode', async (req, res) => {
   try {
     const id = req.query.id || req.query.slug;
@@ -429,7 +431,6 @@ app.get('/episode', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Server — dapat MP4 URL dari serverId
 app.get('/server', async (req, res) => {
   try {
     const id = req.query.id;
@@ -438,10 +439,22 @@ app.get('/server', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// Debug: lihat slug mapping
+app.get('/debug/slug', (req, res) => {
+  const q = req.query.q || '';
+  if (q) {
+    const key = normalizeTitle(q);
+    res.json({ query: q, key, result: slugMap[key] || 'NOT FOUND', mapSize: Object.keys(slugMap).length });
+  } else {
+    const sample = Object.entries(slugMap).slice(0, 20);
+    res.json({ mapSize: Object.keys(slugMap).length, sample });
+  }
+});
+
 // ── START ─────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`🦊 KitsuneID API v5.0 running on port ${PORT}`);
-  console.log('   Jikan (info) + Sanka Vollerei (video) — Zero ScraperAPI!');
+app.listen(PORT, async () => {
+  console.log(`🦊 KitsuneID API v5.1 running on port ${PORT}`);
+  console.log('   Jikan + SIPUTZX (episodes) + Sanka Vollerei (video)');
 
   // Keep-alive
   const SELF = process.env.RAILWAY_PUBLIC_DOMAIN
@@ -453,14 +466,16 @@ app.listen(PORT, () => {
        .on('error', e => console.log('[ping] err:', e.message));
   }, 4 * 60 * 1000);
 
-  // Warm-up cache
+  // Warm-up: build slug map dulu, baru load data
   setTimeout(async () => {
     try {
-      console.log('[warm-up] Ongoing...');
+      console.log('[warm-up] Building slug map...');
+      await buildSlugMap();
+      console.log('[warm-up] Loading ongoing...');
       await getOngoing(1);
-      console.log('[warm-up] Schedule...');
+      console.log('[warm-up] Loading schedule...');
       await getSchedule();
       console.log('[warm-up] ✅ Done!');
     } catch(e) { console.log('[warm-up] Error:', e.message); }
-  }, 3000);
+  }, 2000);
 });
